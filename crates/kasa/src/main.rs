@@ -430,18 +430,18 @@ async fn main() {
                 // Try netif first
                 match send_command(&host, port, timeout, commands::WLANSCAN).await {
                     Ok(response) => {
-                        // Check if the response indicates success
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                            // Check for err_code in netif response
-                            let err_code = json
-                                .get("netif")
-                                .and_then(|n| n.get("get_scaninfo"))
-                                .and_then(|s| s.get("err_code"))
-                                .and_then(|e| e.as_i64());
+                            let scaninfo = json.get("netif").and_then(|n| n.get("get_scaninfo"));
 
-                            if err_code == Some(0) {
-                                println!("{}", json);
-                                return;
+                            if let Some(info) = scaninfo {
+                                // Success if ap_list exists or err_code is 0
+                                let has_ap_list = info.get("ap_list").is_some();
+                                let err_code = info.get("err_code").and_then(|e| e.as_i64());
+
+                                if has_ap_list || err_code == Some(0) {
+                                    println!("{}", json);
+                                    return;
+                                }
                             }
                         }
                         // netif didn't work, try softap fallback
@@ -454,10 +454,28 @@ async fn main() {
 
                 // Fallback to softaponboarding
                 match send_command(&host, port, timeout, commands::WLANSCAN_SOFTAP).await {
-                    Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
-                        Ok(json) => println!("{}", json),
-                        Err(_) => println!("{}", response),
-                    },
+                    Ok(response) => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                            // Check if softap returned an error
+                            let err_code = json
+                                .get("smartlife.iot.common.softaponboarding")
+                                .and_then(|s| s.get("err_code"))
+                                .and_then(|e| e.as_i64());
+
+                            if let Some(code) = err_code
+                                && code != 0
+                            {
+                                eprintln!(
+                                    "Error: WiFi scan not supported by this device (err_code: {})",
+                                    code
+                                );
+                                std::process::exit(1);
+                            }
+                            println!("{}", json);
+                        } else {
+                            println!("{}", response);
+                        }
+                    }
                     Err(e) => {
                         error!("Could not connect to host {}:{}: {}", host, port, e);
                         eprintln!("Error: Could not connect to host {}:{}: {}", host, port, e);
@@ -491,17 +509,17 @@ async fn main() {
                 match send_command(&host, port, timeout, &cmd).await {
                     Ok(response) => {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                            // Check for err_code
-                            let err_code = json
-                                .get("netif")
-                                .and_then(|n| n.get("set_stainfo"))
-                                .and_then(|s| s.get("err_code"))
-                                .and_then(|e| e.as_i64());
+                            let stainfo = json.get("netif").and_then(|n| n.get("set_stainfo"));
 
-                            if err_code == Some(0) {
-                                println!("{}", json);
-                                print_wifi_join_success(&ssid);
-                                return;
+                            if let Some(info) = stainfo {
+                                let err_code = info.get("err_code").and_then(|e| e.as_i64());
+
+                                // err_code 0 means success, missing err_code also treated as success
+                                if err_code.is_none() || err_code == Some(0) {
+                                    println!("{}", json);
+                                    print_wifi_join_success(&ssid);
+                                    return;
+                                }
                             }
                         }
                         // netif didn't work, try softap fallback
@@ -516,9 +534,27 @@ async fn main() {
                 let cmd_softap = commands::wifi_join_softap(&ssid, &pass, keytype);
                 match send_command(&host, port, timeout, &cmd_softap).await {
                     Ok(response) => {
-                        match serde_json::from_str::<serde_json::Value>(&response) {
-                            Ok(json) => println!("{}", json),
-                            Err(_) => println!("{}", response),
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                            // Check if softap returned an error
+                            let err_code = json
+                                .get("smartlife.iot.common.softaponboarding")
+                                .and_then(|s| s.get("err_code"))
+                                .and_then(|e| e.as_i64());
+
+                            if let Some(code) = err_code
+                                && code != 0
+                            {
+                                let err_msg = json
+                                    .get("smartlife.iot.common.softaponboarding")
+                                    .and_then(|s| s.get("err_msg"))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("unknown error");
+                                eprintln!("Error: WiFi join failed: {}", err_msg);
+                                std::process::exit(1);
+                            }
+                            println!("{}", json);
+                        } else {
+                            println!("{}", response);
                         }
                         print_wifi_join_success(&ssid);
                     }
