@@ -389,7 +389,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kasa-exporter"
+name = "kasa-prometheus"
 version = "0.1.0"
 dependencies = [
  "axum",
