@@ -1,5 +1,9 @@
 # kasa-rs
 
+[![CI](https://github.com/cmackenzie1/kasa-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/cmackenzie1/kasa-rs/actions/workflows/rust.yml)
+[![Crates.io](https://img.shields.io/crates/v/kasa)](https://crates.io/crates/kasa)
+[![docs.rs](https://img.shields.io/docsrs/kasa-core)](https://docs.rs/kasa-core/latest/kasa_core/)
+
 A CLI and library for communicating with [TP-Link Kasa](https://www.kasasmart.com/us) smart home devices.
 
 ## Quickstart
