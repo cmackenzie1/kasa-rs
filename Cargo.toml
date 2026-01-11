@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/cmackenzie1/kasa-rs"
+
+[workspace.dependencies]
+kasa-core = { path = "crates/kasa-core" }
+
+clap = { version = "4", default-features = false, features = ["std", "derive", "color", "usage", "help"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
