@@ -1,10 +1,16 @@
 # kasa-rs
 
 [![CI](https://github.com/cmackenzie1/kasa-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/cmackenzie1/kasa-rs/actions/workflows/rust.yml)
-[![Crates.io](https://img.shields.io/crates/v/kasa)](https://crates.io/crates/kasa)
-[![docs.rs](https://img.shields.io/docsrs/kasa-core)](https://docs.rs/kasa-core/latest/kasa_core/)
 
 A CLI and library for communicating with [TP-Link Kasa](https://www.kasasmart.com/us) smart home devices.
+
+## Crates
+
+| Crate | Version | Docs | Description |
+|-------|---------|------|-------------|
+| [kasa](https://crates.io/crates/kasa) | [![Crates.io](https://img.shields.io/crates/v/kasa)](https://crates.io/crates/kasa) | - | CLI for communicating with TP-Link Kasa smart devices |
+| [kasa-core](https://crates.io/crates/kasa-core) | [![Crates.io](https://img.shields.io/crates/v/kasa-core)](https://crates.io/crates/kasa-core) | [![docs.rs](https://img.shields.io/docsrs/kasa-core)](https://docs.rs/kasa-core) | Core library for communicating with TP-Link Kasa smart devices |
+| [kasa-prometheus](https://crates.io/crates/kasa-prometheus) | [![Crates.io](https://img.shields.io/crates/v/kasa-prometheus)](https://crates.io/crates/kasa-prometheus) | [![docs.rs](https://img.shields.io/docsrs/kasa-prometheus)](https://docs.rs/kasa-prometheus) | Prometheus metrics exporter for TP-Link Kasa smart home devices |
 
 ## Quickstart
 
