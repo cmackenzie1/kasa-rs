@@ -172,6 +172,12 @@ pub struct DiscoveredDevice {
     pub relay_state: bool,
     /// Whether the LED is off.
     pub led_off: bool,
+    /// WiFi signal strength in dBm.
+    pub rssi: i32,
+    /// Seconds since the relay was turned on (0 if off).
+    pub on_time: u64,
+    /// Whether a firmware update is in progress.
+    pub updating: bool,
 }
 
 /// Result of a broadcast command to a single device.
@@ -226,6 +232,12 @@ struct SysInfo {
     // Some devices use mic_mac instead of mac
     #[serde(rename = "mic_mac", default)]
     mic_mac: String,
+    #[serde(default)]
+    rssi: i32,
+    #[serde(default)]
+    on_time: u64,
+    #[serde(default)]
+    updating: u8,
 }
 
 /// Encrypts a plaintext string using the TP-Link Smart Home Protocol.
@@ -513,6 +525,9 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                         sw_ver: info.sw_ver,
                         relay_state: info.relay_state == 1,
                         led_off: info.led_off == 1,
+                        rssi: info.rssi,
+                        on_time: info.on_time,
+                        updating: info.updating == 1,
                     });
                 }
             }
