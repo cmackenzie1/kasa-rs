@@ -97,6 +97,20 @@ pub mod commands {
     /// Get cloud connection information.
     pub const CLOUDINFO: &str = r#"{"cnCloud":{"get_info":{}}}"#;
 
+    /// Unbind device from TP-Link cloud account.
+    ///
+    /// This removes the device from cloud control but it continues to work locally.
+    pub const CLOUD_UNBIND: &str = r#"{"cnCloud":{"unbind":{}}}"#;
+
+    /// Bind device to TP-Link cloud account.
+    ///
+    /// Requires username and password - use [`cloud_bind_command`] to generate
+    /// the command with credentials.
+    ///
+    /// [`cloud_bind_command`]: fn.cloud_bind_command.html
+    pub const CLOUD_BIND_TEMPLATE: &str =
+        r#"{"cnCloud":{"bind":{"username":"{{USERNAME}}","password":"{{PASSWORD}}"}}}"#;
+
     /// Get countdown timer rules.
     pub const COUNTDOWN: &str = r#"{"count_down":{"get_rules":{}}}"#;
 
@@ -147,6 +161,33 @@ pub mod commands {
 
     /// Scan for available wireless networks.
     pub const WLANSCAN: &str = r#"{"netif":{"get_scaninfo":{"refresh":0}}}"#;
+
+    /// Generate a cloud bind command with the given credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - TP-Link account email address
+    /// * `password` - TP-Link account password
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kasa_core::commands;
+    ///
+    /// let cmd = commands::cloud_bind("user@example.com", "secret123");
+    /// assert!(cmd.contains("user@example.com"));
+    /// ```
+    ///
+    /// # Security Note
+    ///
+    /// The password is sent in plaintext within the JSON command, though it is
+    /// encrypted using the TP-Link protocol before transmission over the network.
+    pub fn cloud_bind(username: &str, password: &str) -> String {
+        format!(
+            r#"{{"cnCloud":{{"bind":{{"username":"{}","password":"{}"}}}}}}"#,
+            username, password
+        )
+    }
 }
 
 /// Information about a discovered Kasa device.
