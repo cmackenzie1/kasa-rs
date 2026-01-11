@@ -87,17 +87,14 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} -p kasa
 
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf kasa-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz kasa
-          mv kasa-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz ../../../
+      - name: Rename binary
+        run: mv target/${{ matrix.target }}/release/kasa kasa-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: kasa-${{ matrix.target }}
-          path: kasa-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz
+          path: kasa-${{ matrix.target }}
 
   publish:
     needs: [release, build]
