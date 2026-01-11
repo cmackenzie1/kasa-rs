@@ -573,23 +573,24 @@ pub async fn send_command(
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Write timed out"))??;
 
-    // Read response with timeout
-    let mut response = vec![0u8; 4096];
-    let n = timeout(command_timeout, stream.read(&mut response))
+    // Read the 4-byte length header first
+    let mut len_buf = [0u8; 4];
+    timeout(command_timeout, stream.read_exact(&mut len_buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Read timed out"))??;
 
-    debug!("Received {} bytes", n);
+    let payload_len = u32::from_be_bytes(len_buf) as usize;
+    debug!("Response payload length: {} bytes", payload_len);
 
-    if n < 4 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Response too short",
-        ));
-    }
+    // Read the full payload
+    let mut payload = vec![0u8; payload_len];
+    timeout(command_timeout, stream.read_exact(&mut payload))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Read timed out"))??;
 
-    // Skip the 4-byte length header
-    let decrypted = decrypt(&response[4..n]);
+    debug!("Received {} bytes", payload_len);
+
+    let decrypted = decrypt(&payload);
     Ok(decrypted)
 }
 

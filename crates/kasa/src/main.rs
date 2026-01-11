@@ -430,6 +430,7 @@ async fn main() {
                 // Try netif first
                 match send_command(&host, port, timeout, commands::WLANSCAN).await {
                     Ok(response) => {
+                        debug!("netif response: {}", response);
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
                             let scaninfo = json.get("netif").and_then(|n| n.get("get_scaninfo"));
 
@@ -442,7 +443,15 @@ async fn main() {
                                     println!("{}", json);
                                     return;
                                 }
+                                debug!("scaninfo present but no ap_list, err_code: {:?}", err_code);
+                            } else {
+                                debug!(
+                                    "no scaninfo in response, keys: {:?}",
+                                    json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                                );
                             }
+                        } else {
+                            debug!("failed to parse netif response as JSON");
                         }
                         // netif didn't work, try softap fallback
                         debug!("netif scan failed, trying softaponboarding fallback");
