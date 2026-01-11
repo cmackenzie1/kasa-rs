@@ -162,6 +162,13 @@ pub mod commands {
     /// Scan for available wireless networks.
     pub const WLANSCAN: &str = r#"{"netif":{"get_scaninfo":{"refresh":0}}}"#;
 
+    /// Scan for available wireless networks (alternative endpoint for newer devices).
+    ///
+    /// Some newer devices use the `smartlife.iot.common.softaponboarding` module
+    /// instead of `netif`. Try [`WLANSCAN`] first, then fall back to this.
+    pub const WLANSCAN_SOFTAP: &str =
+        r#"{"smartlife.iot.common.softaponboarding":{"get_scaninfo":{"refresh":0}}}"#;
+
     /// Generate a cloud bind command with the given credentials.
     ///
     /// # Arguments
@@ -186,6 +193,54 @@ pub mod commands {
         format!(
             r#"{{"cnCloud":{{"bind":{{"username":"{}","password":"{}"}}}}}}"#,
             username, password
+        )
+    }
+
+    /// Generate a command to connect the device to a WiFi network.
+    ///
+    /// This command is used during device provisioning when the device is in AP mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssid` - Network name (SSID) to connect to
+    /// * `password` - Network password
+    /// * `key_type` - Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kasa_core::commands;
+    ///
+    /// let cmd = commands::wifi_join("MyNetwork", "secret123", 3);
+    /// assert!(cmd.contains("MyNetwork"));
+    /// assert!(cmd.contains("key_type"));
+    /// ```
+    ///
+    /// # Security Note
+    ///
+    /// The password is sent in plaintext within the JSON command, though it is
+    /// encrypted using the TP-Link protocol before transmission over the network.
+    pub fn wifi_join(ssid: &str, password: &str, key_type: u8) -> String {
+        format!(
+            r#"{{"netif":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
+            ssid, password, key_type
+        )
+    }
+
+    /// Generate a command to connect the device to a WiFi network (alternative endpoint).
+    ///
+    /// Some newer devices use the `smartlife.iot.common.softaponboarding` module
+    /// instead of `netif`. Try [`wifi_join`] first, then fall back to this.
+    ///
+    /// # Arguments
+    ///
+    /// * `ssid` - Network name (SSID) to connect to
+    /// * `password` - Network password
+    /// * `key_type` - Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2
+    pub fn wifi_join_softap(ssid: &str, password: &str, key_type: u8) -> String {
+        format!(
+            r#"{{"smartlife.iot.common.softaponboarding":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
+            ssid, password, key_type
         )
     }
 }
@@ -219,6 +274,67 @@ pub struct DiscoveredDevice {
     pub on_time: u64,
     /// Whether a firmware update is in progress.
     pub updating: bool,
+}
+
+/// Security type for WiFi networks.
+///
+/// Used when scanning for networks or joining a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+pub enum KeyType {
+    /// Open network (no security)
+    None = 0,
+    /// WEP encryption (legacy, insecure)
+    Wep = 1,
+    /// WPA-PSK encryption
+    Wpa = 2,
+    /// WPA2-PSK encryption (most common)
+    #[default]
+    Wpa2 = 3,
+}
+
+impl From<KeyType> for u8 {
+    fn from(key_type: KeyType) -> Self {
+        key_type as u8
+    }
+}
+
+impl TryFrom<u8> for KeyType {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(KeyType::None),
+            1 => Ok(KeyType::Wep),
+            2 => Ok(KeyType::Wpa),
+            3 => Ok(KeyType::Wpa2),
+            _ => Err("Invalid key type: must be 0-3"),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyType::None => write!(f, "None"),
+            KeyType::Wep => write!(f, "WEP"),
+            KeyType::Wpa => write!(f, "WPA"),
+            KeyType::Wpa2 => write!(f, "WPA2"),
+        }
+    }
+}
+
+/// Information about a WiFi network from a scan.
+///
+/// Returned by the device when scanning for available networks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WifiNetwork {
+    /// Network name (SSID)
+    pub ssid: String,
+    /// Security type
+    pub key_type: u8,
+    /// Signal strength in dBm (negative, closer to 0 = stronger)
+    pub rssi: i32,
 }
 
 /// Result of a broadcast command to a single device.

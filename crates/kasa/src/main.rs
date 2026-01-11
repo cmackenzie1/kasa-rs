@@ -66,6 +66,28 @@ enum Command {
         #[command(subcommand)]
         command: BroadcastCommand,
     },
+
+    /// WiFi provisioning commands for devices in AP mode.
+    ///
+    /// When a Kasa device is new or factory reset, it creates an open WiFi
+    /// access point (SSID: TP-LINK_Smart Plug_XXXX). Connect to this AP,
+    /// then use these commands to configure the device's WiFi connection.
+    Wifi {
+        /// Target hostname or IP address (default: 192.168.0.1 for AP mode)
+        #[arg(long, default_value = "192.168.0.1")]
+        host: String,
+
+        /// Target port
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+
+        /// Timeout in seconds
+        #[arg(long, value_parser = parse_duration, default_value = "10")]
+        timeout: Duration,
+
+        #[command(subcommand)]
+        command: WifiCommand,
+    },
 }
 
 /// Commands available for single device operations
@@ -159,6 +181,32 @@ enum BroadcastCommand {
     Wlanscan,
 }
 
+/// WiFi provisioning commands for devices in AP mode.
+#[derive(Subcommand)]
+enum WifiCommand {
+    /// Scan for available WiFi networks visible to the device
+    Scan,
+
+    /// Connect device to a WiFi network
+    Join {
+        /// Network name (SSID)
+        ssid: String,
+
+        /// Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2 (default: 3)
+        #[arg(long, default_value = "3")]
+        keytype: u8,
+
+        /// Read password from stdin instead of prompting.
+        /// Useful for scripting: echo "pass" | kasa wifi join SSID --password-stdin
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
+
+        /// Password (not recommended - use --password-stdin or interactive prompt instead)
+        #[arg(long, hide = true)]
+        password: Option<String>,
+    },
+}
+
 /// Represents the result of converting a command to JSON.
 /// Some commands require special handling (like password prompts).
 enum CommandJson {
@@ -234,14 +282,21 @@ impl BroadcastCommand {
 
 /// Read password securely based on the provided options.
 ///
-/// Priority:
-/// 1. If `--password` was provided (hidden option), use it
-/// 2. If `--password-stdin` was provided, read from stdin
+/// # Arguments
+///
+/// * `password_stdin` - Whether to read from stdin
+/// * `password` - Pre-provided password (hidden CLI option)
+/// * `prompt` - The prompt to display when reading interactively
+///
+/// # Priority
+///
+/// 1. If `password` was provided (hidden option), use it
+/// 2. If `password_stdin` is true, read from stdin
 /// 3. Otherwise, prompt interactively (if terminal is available)
 fn read_password(
     password_stdin: bool,
     password: Option<String>,
-    username: &str,
+    prompt: &str,
 ) -> Result<String, String> {
     // Option 1: Password provided directly (hidden flag, not recommended)
     if let Some(pass) = password {
@@ -259,7 +314,7 @@ fn read_password(
 
     // Option 3: Interactive prompt
     if std::io::stdin().is_terminal() {
-        eprint!("Password for {}: ", username);
+        eprint!("{}: ", prompt);
         rpassword::read_password().map_err(|e| format!("Failed to read password: {}", e))
     } else {
         Err("No password provided. Use --password-stdin when piping input.".to_string())
@@ -309,7 +364,8 @@ async fn main() {
                     password_stdin,
                     password,
                 }) => {
-                    let pass = match read_password(password_stdin, password, &username) {
+                    let prompt = format!("Password for {}", username);
+                    let pass = match read_password(password_stdin, password, &prompt) {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("Error: {}", e);
@@ -361,5 +417,135 @@ async fn main() {
                 }
             }
         }
+
+        Command::Wifi {
+            host,
+            port,
+            timeout,
+            command,
+        } => match command {
+            WifiCommand::Scan => {
+                debug!("Scanning for WiFi networks via {}", host);
+
+                // Try netif first
+                match send_command(&host, port, timeout, commands::WLANSCAN).await {
+                    Ok(response) => {
+                        // Check if the response indicates success
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                            // Check for err_code in netif response
+                            let err_code = json
+                                .get("netif")
+                                .and_then(|n| n.get("get_scaninfo"))
+                                .and_then(|s| s.get("err_code"))
+                                .and_then(|e| e.as_i64());
+
+                            if err_code == Some(0) {
+                                println!("{}", json);
+                                return;
+                            }
+                        }
+                        // netif didn't work, try softap fallback
+                        debug!("netif scan failed, trying softaponboarding fallback");
+                    }
+                    Err(e) => {
+                        debug!("netif scan error: {}, trying softaponboarding fallback", e);
+                    }
+                }
+
+                // Fallback to softaponboarding
+                match send_command(&host, port, timeout, commands::WLANSCAN_SOFTAP).await {
+                    Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                        Ok(json) => println!("{}", json),
+                        Err(_) => println!("{}", response),
+                    },
+                    Err(e) => {
+                        error!("Could not connect to host {}:{}: {}", host, port, e);
+                        eprintln!("Error: Could not connect to host {}:{}: {}", host, port, e);
+                        eprintln!();
+                        eprintln!("Make sure you are connected to the device's WiFi AP");
+                        eprintln!("(SSID looks like: TP-LINK_Smart Plug_XXXX)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            WifiCommand::Join {
+                ssid,
+                keytype,
+                password_stdin,
+                password,
+            } => {
+                let prompt = format!("WiFi password for '{}'", ssid);
+                let pass = match read_password(password_stdin, password, &prompt) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                debug!("Joining WiFi network '{}' with key_type {}", ssid, keytype);
+
+                // Try netif first
+                let cmd = commands::wifi_join(&ssid, &pass, keytype);
+                match send_command(&host, port, timeout, &cmd).await {
+                    Ok(response) => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                            // Check for err_code
+                            let err_code = json
+                                .get("netif")
+                                .and_then(|n| n.get("set_stainfo"))
+                                .and_then(|s| s.get("err_code"))
+                                .and_then(|e| e.as_i64());
+
+                            if err_code == Some(0) {
+                                println!("{}", json);
+                                print_wifi_join_success(&ssid);
+                                return;
+                            }
+                        }
+                        // netif didn't work, try softap fallback
+                        debug!("netif join failed, trying softaponboarding fallback");
+                    }
+                    Err(e) => {
+                        debug!("netif join error: {}, trying softaponboarding fallback", e);
+                    }
+                }
+
+                // Fallback to softaponboarding
+                let cmd_softap = commands::wifi_join_softap(&ssid, &pass, keytype);
+                match send_command(&host, port, timeout, &cmd_softap).await {
+                    Ok(response) => {
+                        match serde_json::from_str::<serde_json::Value>(&response) {
+                            Ok(json) => println!("{}", json),
+                            Err(_) => println!("{}", response),
+                        }
+                        print_wifi_join_success(&ssid);
+                    }
+                    Err(e) => {
+                        error!("Could not connect to host {}:{}: {}", host, port, e);
+                        eprintln!("Error: Could not connect to host {}:{}: {}", host, port, e);
+                        eprintln!();
+                        eprintln!("Make sure you are connected to the device's WiFi AP");
+                        eprintln!("(SSID looks like: TP-LINK_Smart Plug_XXXX)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
     }
+}
+
+/// Print guidance message after successful WiFi join command.
+fn print_wifi_join_success(ssid: &str) {
+    eprintln!();
+    eprintln!("WiFi credentials sent successfully!");
+    eprintln!();
+    eprintln!("The device will now:");
+    eprintln!("  1. Disconnect from its access point (you will lose connection)");
+    eprintln!("  2. Attempt to connect to '{}'", ssid);
+    eprintln!();
+    eprintln!("To verify the device joined your network, reconnect to your");
+    eprintln!("normal WiFi and run:");
+    eprintln!("  kasa discover");
 }
