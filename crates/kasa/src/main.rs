@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{io::IsTerminal, time::Duration};
 
 use clap::{Parser, Subcommand};
 use kasa_core::{DEFAULT_PORT, broadcast, commands, discover, send_command};
@@ -75,6 +75,23 @@ enum DeviceCommand {
     Antitheft,
     /// Get cloud info
     Cloudinfo,
+    /// Unbind device from TP-Link cloud account
+    CloudUnbind,
+    /// Bind device to TP-Link cloud account
+    CloudBind {
+        /// TP-Link account email address
+        #[arg(long, short)]
+        username: String,
+
+        /// Read password from stdin instead of prompting.
+        /// Useful for scripting: echo "pass" | kasa device <ip> cloud-bind -u user --password-stdin
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
+
+        /// Password (not recommended - use --password-stdin or interactive prompt instead)
+        #[arg(long, hide = true)]
+        password: Option<String>,
+    },
     /// Get countdown rules
     Countdown,
     /// Reset energy meter statistics
@@ -118,6 +135,8 @@ enum BroadcastCommand {
     Antitheft,
     /// Get cloud info from all devices
     Cloudinfo,
+    /// Unbind all devices from TP-Link cloud account
+    CloudUnbind,
     /// Get countdown rules from all devices
     Countdown,
     /// Get real-time energy readings from all devices
@@ -140,26 +159,55 @@ enum BroadcastCommand {
     Wlanscan,
 }
 
+/// Represents the result of converting a command to JSON.
+/// Some commands require special handling (like password prompts).
+enum CommandJson {
+    /// A static command string
+    Static(&'static str),
+    /// A dynamically generated command string
+    Dynamic(String),
+    /// Command requires special handling
+    Special(SpecialCommand),
+}
+
+enum SpecialCommand {
+    CloudBind {
+        username: String,
+        password_stdin: bool,
+        password: Option<String>,
+    },
+}
+
 impl DeviceCommand {
-    fn to_json(&self) -> &str {
+    fn to_command_json(&self) -> CommandJson {
         match self {
-            DeviceCommand::Antitheft => commands::ANTITHEFT,
-            DeviceCommand::Cloudinfo => commands::CLOUDINFO,
-            DeviceCommand::Countdown => commands::COUNTDOWN,
-            DeviceCommand::EnergyReset => commands::ENERGY_RESET,
-            DeviceCommand::Energy => commands::ENERGY,
-            DeviceCommand::Info => commands::INFO,
-            DeviceCommand::Ledoff => commands::LED_OFF,
-            DeviceCommand::Ledon => commands::LED_ON,
-            DeviceCommand::Off => commands::RELAY_OFF,
-            DeviceCommand::On => commands::RELAY_ON,
-            DeviceCommand::Reboot => commands::REBOOT,
-            DeviceCommand::Reset => commands::RESET,
-            DeviceCommand::RuntimeReset => commands::RUNTIME_RESET,
-            DeviceCommand::Schedule => commands::SCHEDULE,
-            DeviceCommand::Time => commands::TIME,
-            DeviceCommand::Wlanscan => commands::WLANSCAN,
-            DeviceCommand::Raw { json } => json.as_str(),
+            DeviceCommand::Antitheft => CommandJson::Static(commands::ANTITHEFT),
+            DeviceCommand::Cloudinfo => CommandJson::Static(commands::CLOUDINFO),
+            DeviceCommand::CloudUnbind => CommandJson::Static(commands::CLOUD_UNBIND),
+            DeviceCommand::CloudBind {
+                username,
+                password_stdin,
+                password,
+            } => CommandJson::Special(SpecialCommand::CloudBind {
+                username: username.clone(),
+                password_stdin: *password_stdin,
+                password: password.clone(),
+            }),
+            DeviceCommand::Countdown => CommandJson::Static(commands::COUNTDOWN),
+            DeviceCommand::EnergyReset => CommandJson::Static(commands::ENERGY_RESET),
+            DeviceCommand::Energy => CommandJson::Static(commands::ENERGY),
+            DeviceCommand::Info => CommandJson::Static(commands::INFO),
+            DeviceCommand::Ledoff => CommandJson::Static(commands::LED_OFF),
+            DeviceCommand::Ledon => CommandJson::Static(commands::LED_ON),
+            DeviceCommand::Off => CommandJson::Static(commands::RELAY_OFF),
+            DeviceCommand::On => CommandJson::Static(commands::RELAY_ON),
+            DeviceCommand::Reboot => CommandJson::Static(commands::REBOOT),
+            DeviceCommand::Reset => CommandJson::Static(commands::RESET),
+            DeviceCommand::RuntimeReset => CommandJson::Static(commands::RUNTIME_RESET),
+            DeviceCommand::Schedule => CommandJson::Static(commands::SCHEDULE),
+            DeviceCommand::Time => CommandJson::Static(commands::TIME),
+            DeviceCommand::Wlanscan => CommandJson::Static(commands::WLANSCAN),
+            DeviceCommand::Raw { json } => CommandJson::Dynamic(json.clone()),
         }
     }
 }
@@ -169,6 +217,7 @@ impl BroadcastCommand {
         match self {
             BroadcastCommand::Antitheft => commands::ANTITHEFT,
             BroadcastCommand::Cloudinfo => commands::CLOUDINFO,
+            BroadcastCommand::CloudUnbind => commands::CLOUD_UNBIND,
             BroadcastCommand::Countdown => commands::COUNTDOWN,
             BroadcastCommand::Energy => commands::ENERGY,
             BroadcastCommand::Info => commands::INFO,
@@ -180,6 +229,40 @@ impl BroadcastCommand {
             BroadcastCommand::Time => commands::TIME,
             BroadcastCommand::Wlanscan => commands::WLANSCAN,
         }
+    }
+}
+
+/// Read password securely based on the provided options.
+///
+/// Priority:
+/// 1. If `--password` was provided (hidden option), use it
+/// 2. If `--password-stdin` was provided, read from stdin
+/// 3. Otherwise, prompt interactively (if terminal is available)
+fn read_password(
+    password_stdin: bool,
+    password: Option<String>,
+    username: &str,
+) -> Result<String, String> {
+    // Option 1: Password provided directly (hidden flag, not recommended)
+    if let Some(pass) = password {
+        return Ok(pass);
+    }
+
+    // Option 2: Read from stdin
+    if password_stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read password from stdin: {}", e))?;
+        return Ok(input.trim().to_string());
+    }
+
+    // Option 3: Interactive prompt
+    if std::io::stdin().is_terminal() {
+        eprint!("Password for {}: ", username);
+        rpassword::read_password().map_err(|e| format!("Failed to read password: {}", e))
+    } else {
+        Err("No password provided. Use --password-stdin when piping input.".to_string())
     }
 }
 
@@ -218,10 +301,28 @@ async fn main() {
             timeout,
             command,
         } => {
-            let command_json = command.to_json();
+            let command_json = match command.to_command_json() {
+                CommandJson::Static(s) => s.to_string(),
+                CommandJson::Dynamic(s) => s,
+                CommandJson::Special(SpecialCommand::CloudBind {
+                    username,
+                    password_stdin,
+                    password,
+                }) => {
+                    let pass = match read_password(password_stdin, password, &username) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    commands::cloud_bind(&username, &pass)
+                }
+            };
+
             debug!("Command: {}", command_json);
 
-            match send_command(&target, port, timeout, command_json).await {
+            match send_command(&target, port, timeout, &command_json).await {
                 Ok(response) => {
                     // Validate it's proper JSON and output
                     match serde_json::from_str::<serde_json::Value>(&response) {
