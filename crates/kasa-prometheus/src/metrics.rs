@@ -17,6 +17,19 @@ pub struct DeviceLabels {
     pub ip: String,
 }
 
+/// Labels for plug-level metrics on power strips.
+/// Includes a plug identifier for individual outlet tracking.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PlugLabels {
+    pub device_id: String,
+    pub alias: String,
+    pub model: String,
+    pub ip: String,
+    pub plug_id: String,
+    pub plug_alias: String,
+    pub plug_slot: String,
+}
+
 /// Labels for device info metric (includes version information).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DeviceInfoLabels {
@@ -87,6 +100,14 @@ pub struct DeviceMetrics {
     power_watts: Family<DeviceLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
     energy_watt_hours_total: Family<DeviceLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
 
+    // Per-plug energy metrics for power strips
+    plug_voltage_volts: Family<PlugLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    plug_current_amps: Family<PlugLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    plug_power_watts: Family<PlugLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    plug_energy_watt_hours_total: Family<PlugLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    plug_relay_state: Family<PlugLabels, Gauge>,
+    plug_on_time_seconds: Family<PlugLabels, Gauge>,
+
     // Exporter metrics
     scrape_success: Family<ScrapeLabels, Gauge>,
     scrape_duration_seconds: Gauge<f64, std::sync::atomic::AtomicU64>,
@@ -108,6 +129,12 @@ impl DeviceMetrics {
             current_amps: Family::default(),
             power_watts: Family::default(),
             energy_watt_hours_total: Family::default(),
+            plug_voltage_volts: Family::default(),
+            plug_current_amps: Family::default(),
+            plug_power_watts: Family::default(),
+            plug_energy_watt_hours_total: Family::default(),
+            plug_relay_state: Family::default(),
+            plug_on_time_seconds: Family::default(),
             scrape_success: Family::default(),
             scrape_duration_seconds: Gauge::default(),
             devices_discovered: Gauge::default(),
@@ -178,6 +205,43 @@ impl DeviceMetrics {
             "kasa_device_energy_watt_hours_total",
             "Total energy consumed in watt-hours",
             metrics.energy_watt_hours_total.clone(),
+        );
+
+        // Per-plug metrics for power strips
+        registry.register(
+            "kasa_plug_voltage_volts",
+            "Current voltage in volts for individual plug",
+            metrics.plug_voltage_volts.clone(),
+        );
+
+        registry.register(
+            "kasa_plug_current_amps",
+            "Current draw in amps for individual plug",
+            metrics.plug_current_amps.clone(),
+        );
+
+        registry.register(
+            "kasa_plug_power_watts",
+            "Current power consumption in watts for individual plug",
+            metrics.plug_power_watts.clone(),
+        );
+
+        registry.register(
+            "kasa_plug_energy_watt_hours_total",
+            "Total energy consumed in watt-hours for individual plug",
+            metrics.plug_energy_watt_hours_total.clone(),
+        );
+
+        registry.register(
+            "kasa_plug_relay_state",
+            "Relay state for individual plug (1 = on, 0 = off)",
+            metrics.plug_relay_state.clone(),
+        );
+
+        registry.register(
+            "kasa_plug_on_time_seconds",
+            "Seconds since relay was turned on for individual plug",
+            metrics.plug_on_time_seconds.clone(),
         );
 
         registry.register(
@@ -276,6 +340,42 @@ impl DeviceMetrics {
         self.energy_watt_hours_total
             .get_or_create(&DeviceLabels::from(device))
             .set(watt_hours);
+    }
+
+    /// Set voltage in volts for a specific plug
+    pub fn set_plug_voltage(&self, labels: &PlugLabels, volts: f64) {
+        self.plug_voltage_volts.get_or_create(labels).set(volts);
+    }
+
+    /// Set current in amps for a specific plug
+    pub fn set_plug_current(&self, labels: &PlugLabels, amps: f64) {
+        self.plug_current_amps.get_or_create(labels).set(amps);
+    }
+
+    /// Set power in watts for a specific plug
+    pub fn set_plug_power(&self, labels: &PlugLabels, watts: f64) {
+        self.plug_power_watts.get_or_create(labels).set(watts);
+    }
+
+    /// Set total energy in watt-hours for a specific plug
+    pub fn set_plug_energy_total(&self, labels: &PlugLabels, watt_hours: f64) {
+        self.plug_energy_watt_hours_total
+            .get_or_create(labels)
+            .set(watt_hours);
+    }
+
+    /// Set relay state for a specific plug
+    pub fn set_plug_relay_state(&self, labels: &PlugLabels, state: bool) {
+        self.plug_relay_state
+            .get_or_create(labels)
+            .set(if state { 1 } else { 0 });
+    }
+
+    /// Set on time in seconds for a specific plug
+    pub fn set_plug_on_time(&self, labels: &PlugLabels, seconds: u64) {
+        self.plug_on_time_seconds
+            .get_or_create(labels)
+            .set(seconds as i64);
     }
 
     /// Set scrape success for a device

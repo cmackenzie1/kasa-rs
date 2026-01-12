@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 mod metrics;
 
-use metrics::DeviceMetrics;
+use metrics::{DeviceMetrics, PlugLabels};
 
 /// Prometheus metrics exporter for TP-Link Kasa smart home devices.
 #[derive(Parser)]
@@ -142,7 +142,37 @@ async fn poll_devices(
 
                     // Poll each device for additional data (energy, cloud status)
                     for device in devices {
-                        poll_single_device(&state, &device, command_timeout).await;
+                        // For discovery mode, we need to fetch sysinfo to check for children
+                        match kasa_core::send_command(
+                            &device.ip.to_string(),
+                            device.port,
+                            command_timeout,
+                            kasa_core::commands::INFO,
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&response)
+                                    && let Some(sysinfo) =
+                                        json.get("system").and_then(|s| s.get("get_sysinfo"))
+                                {
+                                    let children =
+                                        sysinfo.get("children").and_then(|c| c.as_array());
+                                    poll_single_device(
+                                        &state,
+                                        &device,
+                                        command_timeout,
+                                        sysinfo,
+                                        children,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to get sysinfo from {}: {}", device.alias, e);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -173,6 +203,8 @@ async fn poll_single_device(
     state: &AppState,
     device: &kasa_core::DiscoveredDevice,
     command_timeout: Duration,
+    _sysinfo: &serde_json::Value,
+    children: Option<&Vec<serde_json::Value>>,
 ) {
     let ip = device.ip.to_string();
 
@@ -184,40 +216,100 @@ async fn poll_single_device(
     state.metrics.set_on_time(device, device.on_time);
     state.metrics.set_updating(device, device.updating);
 
-    // Try to get energy data (may not be supported by all devices)
-    match kasa_core::send_command(
-        &ip,
-        device.port,
-        command_timeout,
-        kasa_core::commands::ENERGY,
-    )
-    .await
-    {
-        Ok(response) => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                if let Some(emeter) = json.get("emeter").and_then(|e| e.get("get_realtime")) {
-                    // Check for error
-                    if emeter.get("err_code").and_then(|c| c.as_i64()) == Some(0) {
-                        parse_energy_metrics(state, device, emeter);
-                        state.metrics.set_scrape_success(device, true);
+    // Check if this is a power strip with children
+    if let Some(children) = children {
+        debug!(
+            "{} ({}) is a power strip with {} plugs",
+            device.alias,
+            device.model,
+            children.len()
+        );
+
+        // Set per-plug state from sysinfo
+        for (slot, child) in children.iter().enumerate() {
+            let plug_id = child
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let plug_alias = child
+                .get("alias")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let plug_state = child.get("state").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            let plug_on_time = child.get("on_time").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let labels = PlugLabels {
+                device_id: device.device_id.clone(),
+                alias: device.alias.clone(),
+                model: device.model.clone(),
+                ip: ip.clone(),
+                plug_id: plug_id.clone(),
+                plug_alias,
+                plug_slot: slot.to_string(),
+            };
+
+            state.metrics.set_plug_relay_state(&labels, plug_state);
+            state.metrics.set_plug_on_time(&labels, plug_on_time);
+
+            // Get energy data for this plug
+            let energy_cmd = kasa_core::commands::energy_for_child(&plug_id);
+            match kasa_core::send_command(&ip, device.port, command_timeout, &energy_cmd).await {
+                Ok(response) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
+                        && let Some(emeter) = json.get("emeter").and_then(|e| e.get("get_realtime"))
+                        && emeter.get("err_code").and_then(|c| c.as_i64()) == Some(0)
+                    {
+                        parse_plug_energy_metrics(state, &labels, emeter);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to get energy data from {} plug {}: {}",
+                        device.alias, slot, e
+                    );
+                }
+            }
+        }
+
+        state.metrics.set_scrape_success(device, true);
+    } else {
+        // Single device - try to get energy data (may not be supported by all devices)
+        match kasa_core::send_command(
+            &ip,
+            device.port,
+            command_timeout,
+            kasa_core::commands::ENERGY,
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                    if let Some(emeter) = json.get("emeter").and_then(|e| e.get("get_realtime")) {
+                        // Check for error
+                        if emeter.get("err_code").and_then(|c| c.as_i64()) == Some(0) {
+                            parse_energy_metrics(state, device, emeter);
+                            state.metrics.set_scrape_success(device, true);
+                        } else {
+                            // Device doesn't support energy monitoring
+                            debug!(
+                                "{} ({}) does not support energy monitoring",
+                                device.alias, device.model
+                            );
+                            state.metrics.set_scrape_success(device, true);
+                        }
                     } else {
-                        // Device doesn't support energy monitoring
-                        debug!(
-                            "{} ({}) does not support energy monitoring",
-                            device.alias, device.model
-                        );
                         state.metrics.set_scrape_success(device, true);
                     }
                 } else {
                     state.metrics.set_scrape_success(device, true);
                 }
-            } else {
-                state.metrics.set_scrape_success(device, true);
             }
-        }
-        Err(e) => {
-            warn!("Failed to get energy data from {}: {}", device.alias, e);
-            state.metrics.set_scrape_success(device, false);
+            Err(e) => {
+                warn!("Failed to get energy data from {}: {}", device.alias, e);
+                state.metrics.set_scrape_success(device, false);
+            }
         }
     }
 
@@ -331,10 +423,55 @@ async fn poll_targeted_device(
             == 1,
     };
 
+    // Check if this is a power strip with children
+    let children = sysinfo.get("children").and_then(|c| c.as_array());
+
     // Now poll for additional data using the constructed device
-    poll_single_device(state, &device, command_timeout).await;
+    poll_single_device(state, &device, command_timeout, sysinfo, children).await;
 
     Ok(())
+}
+
+/// Parse energy meter response and update metrics for a plug
+fn parse_plug_energy_metrics(state: &AppState, labels: &PlugLabels, emeter: &serde_json::Value) {
+    // Voltage (may be in voltage_mv or voltage)
+    if let Some(voltage) = emeter
+        .get("voltage_mv")
+        .and_then(|v| v.as_f64())
+        .map(|v| v / 1000.0)
+        .or_else(|| emeter.get("voltage").and_then(|v| v.as_f64()))
+    {
+        state.metrics.set_plug_voltage(labels, voltage);
+    }
+
+    // Current (may be in current_ma or current)
+    if let Some(current) = emeter
+        .get("current_ma")
+        .and_then(|v| v.as_f64())
+        .map(|v| v / 1000.0)
+        .or_else(|| emeter.get("current").and_then(|v| v.as_f64()))
+    {
+        state.metrics.set_plug_current(labels, current);
+    }
+
+    // Power (may be in power_mw or power)
+    if let Some(power) = emeter
+        .get("power_mw")
+        .and_then(|v| v.as_f64())
+        .map(|v| v / 1000.0)
+        .or_else(|| emeter.get("power").and_then(|v| v.as_f64()))
+    {
+        state.metrics.set_plug_power(labels, power);
+    }
+
+    // Total energy (may be in total_wh or total)
+    if let Some(total) = emeter
+        .get("total_wh")
+        .and_then(|v| v.as_f64())
+        .or_else(|| emeter.get("total").and_then(|v| v.as_f64()))
+    {
+        state.metrics.set_plug_energy_total(labels, total);
+    }
 }
 
 /// Parse energy meter response and update metrics
