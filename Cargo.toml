@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/cmackenzie1/kasa-rs"
 
 [workspace.dependencies]
-kasa-core = { version = "0.3.0", path = "crates/kasa-core" }
+kasa-core = { version = "0.4.0", path = "crates/kasa-core" }
 
 clap = { version = "4", default-features = false, features = ["std", "derive", "color", "usage", "help"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
