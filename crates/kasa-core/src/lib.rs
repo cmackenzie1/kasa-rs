@@ -243,6 +243,74 @@ pub mod commands {
             ssid, password, key_type
         )
     }
+
+    /// Wrap a command with context for a specific child plug.
+    ///
+    /// Power strips like the HS300 have multiple outlets (children). To send
+    /// commands to a specific outlet, you need to wrap the command with a
+    /// context containing the child ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from sysinfo children array)
+    /// * `command` - The JSON command to wrap (must be a valid JSON object without outer braces)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kasa_core::commands;
+    ///
+    /// // Get energy for a specific plug
+    /// let cmd = commands::with_child_context(
+    ///     "80064BBD5F529B1CE4DA888AF48CF58C24F0263501",
+    ///     r#""emeter":{"get_realtime":{}}"#
+    /// );
+    /// assert!(cmd.contains("context"));
+    /// assert!(cmd.contains("child_ids"));
+    /// ```
+    pub fn with_child_context(child_id: &str, command_inner: &str) -> String {
+        format!(
+            r#"{{"context":{{"child_ids":["{}"]}},{}}}"#,
+            child_id, command_inner
+        )
+    }
+
+    /// Generate an energy reading command for a specific child plug.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from sysinfo children array)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kasa_core::commands;
+    ///
+    /// let cmd = commands::energy_for_child("80064BBD5F529B1CE4DA888AF48CF58C24F0263501");
+    /// assert!(cmd.contains("emeter"));
+    /// assert!(cmd.contains("get_realtime"));
+    /// ```
+    pub fn energy_for_child(child_id: &str) -> String {
+        with_child_context(child_id, r#""emeter":{"get_realtime":{}}"#)
+    }
+
+    /// Generate a relay on command for a specific child plug.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from sysinfo children array)
+    pub fn relay_on_for_child(child_id: &str) -> String {
+        with_child_context(child_id, r#""system":{"set_relay_state":{"state":1}}"#)
+    }
+
+    /// Generate a relay off command for a specific child plug.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from sysinfo children array)
+    pub fn relay_off_for_child(child_id: &str) -> String {
+        with_child_context(child_id, r#""system":{"set_relay_state":{"state":0}}"#)
+    }
 }
 
 /// Information about a discovered Kasa device.
