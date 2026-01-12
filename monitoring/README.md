@@ -102,6 +102,8 @@ Default scrape interval is 15 seconds. Metrics are retained for 30 days.
 
 ## Dashboard
 
+**Example:** [Live Dashboard Snapshot](https://snapshots.raintank.io/dashboard/snapshot/R9GNhEwQ4xoowZA2pFqgfoePy0jMJDgY?orgId=0&refresh=30s)
+
 The included "Kasa Smart Home Devices" dashboard provides:
 
 ### Overview Section
