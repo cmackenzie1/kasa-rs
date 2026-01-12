@@ -49,6 +49,12 @@ enum Command {
         #[arg(long, value_parser = parse_duration, default_value = "10")]
         timeout: Duration,
 
+        /// Child plug ID for power strips (e.g., HS300).
+        /// Use 'info' command to see available child IDs in the 'children' array.
+        /// Can be the full ID or just the slot number (0-5).
+        #[arg(long)]
+        plug: Option<String>,
+
         #[command(subcommand)]
         command: DeviceCommand,
     },
@@ -354,25 +360,124 @@ async fn main() {
             target,
             port,
             timeout,
+            plug,
             command,
         } => {
-            let command_json = match command.to_command_json() {
-                CommandJson::Static(s) => s.to_string(),
-                CommandJson::Dynamic(s) => s,
-                CommandJson::Special(SpecialCommand::CloudBind {
-                    username,
-                    password_stdin,
-                    password,
-                }) => {
-                    let prompt = format!("Password for {}", username);
-                    let pass = match read_password(password_stdin, password, &prompt) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
+            // Resolve plug ID if specified
+            let child_id = match &plug {
+                Some(plug_arg) => {
+                    // Check if it's a slot number (0-9) or a full ID
+                    if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
+                        // It's a slot number, need to fetch sysinfo to get the full ID
+                        let slot: usize = plug_arg.parse().unwrap_or_else(|_| {
+                            eprintln!("Error: Invalid plug number: {}", plug_arg);
                             std::process::exit(1);
+                        });
+
+                        debug!("Resolving plug slot {} to child ID", slot);
+                        match send_command(&target, port, timeout, commands::INFO).await {
+                            Ok(response) => {
+                                match serde_json::from_str::<serde_json::Value>(&response) {
+                                    Ok(json) => {
+                                        let children = json
+                                            .get("system")
+                                            .and_then(|s| s.get("get_sysinfo"))
+                                            .and_then(|s| s.get("children"))
+                                            .and_then(|c| c.as_array());
+
+                                        match children {
+                                            Some(children) => {
+                                                if slot >= children.len() {
+                                                    eprintln!(
+                                                        "Error: Plug {} not found. Device has {} plugs (0-{})",
+                                                        slot,
+                                                        children.len(),
+                                                        children.len() - 1
+                                                    );
+                                                    std::process::exit(1);
+                                                }
+                                                children[slot]
+                                                    .get("id")
+                                                    .and_then(|id| id.as_str())
+                                                    .map(|s| s.to_string())
+                                                    .unwrap_or_else(|| {
+                                                        eprintln!("Error: Plug {} has no ID", slot);
+                                                        std::process::exit(1);
+                                                    })
+                                            }
+                                            None => {
+                                                eprintln!(
+                                                    "Error: Device does not have child plugs. \
+                                                    The --plug option is only for power strips."
+                                                );
+                                                std::process::exit(1);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error: Failed to parse sysinfo: {}", e);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: Failed to get sysinfo: {}", e);
+                                std::process::exit(1);
+                            }
                         }
-                    };
-                    commands::cloud_bind(&username, &pass)
+                    } else {
+                        // It's a full child ID
+                        plug_arg.clone()
+                    }
+                }
+                None => String::new(),
+            };
+
+            let command_json = if !child_id.is_empty() {
+                // Wrap command with child context
+                match &command {
+                    DeviceCommand::Energy => commands::energy_for_child(&child_id),
+                    DeviceCommand::On => commands::relay_on_for_child(&child_id),
+                    DeviceCommand::Off => commands::relay_off_for_child(&child_id),
+                    _ => {
+                        // For other commands, check if they can be wrapped
+                        match command.to_command_json() {
+                            CommandJson::Static(s) => {
+                                // Extract inner content from static command
+                                // e.g., {"emeter":{"get_realtime":{}}} -> "emeter":{"get_realtime":{}}
+                                let inner = s.trim_start_matches('{').trim_end_matches('}');
+                                commands::with_child_context(&child_id, inner)
+                            }
+                            CommandJson::Dynamic(s) => {
+                                let inner = s.trim_start_matches('{').trim_end_matches('}');
+                                commands::with_child_context(&child_id, inner)
+                            }
+                            CommandJson::Special(SpecialCommand::CloudBind { .. }) => {
+                                eprintln!("Error: cloud-bind command cannot be used with --plug");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            } else {
+                match command.to_command_json() {
+                    CommandJson::Static(s) => s.to_string(),
+                    CommandJson::Dynamic(s) => s,
+                    CommandJson::Special(SpecialCommand::CloudBind {
+                        username,
+                        password_stdin,
+                        password,
+                    }) => {
+                        let prompt = format!("Password for {}", username);
+                        let pass = match read_password(password_stdin, password, &prompt) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+                        commands::cloud_bind(&username, &pass)
+                    }
                 }
             };
 
