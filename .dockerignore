@@ -1,0 +1,27 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+LICENSE
+
+# CI/CD
+.github/
+
+# Monitoring stack (don't need in build context)
+monitoring/
+docker-compose.yml
+
+# Other
+.DS_Store
