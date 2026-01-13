@@ -30,6 +30,10 @@ pub enum Error {
     /// Device returned an error response.
     #[error("device error: {0}")]
     DeviceError(String),
+
+    /// Failed to parse device response.
+    #[error("parse error: {0}")]
+    ParseError(String),
 }
 
 impl From<std::io::Error> for Error {
