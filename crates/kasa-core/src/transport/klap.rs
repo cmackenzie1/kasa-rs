@@ -579,7 +579,7 @@ impl KlapTransport {
 
 #[async_trait]
 impl Transport for KlapTransport {
-    async fn send(&mut self, command: &str) -> Result<String, Error> {
+    async fn send(&self, command: &str) -> Result<String, Error> {
         self.send_request(command).await
     }
 

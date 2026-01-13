@@ -125,7 +125,7 @@ impl LegacyTransport {
 
 #[async_trait]
 impl Transport for LegacyTransport {
-    async fn send(&mut self, command: &str) -> Result<String, Error> {
+    async fn send(&self, command: &str) -> Result<String, Error> {
         self.send_command(command).await
     }
 

@@ -229,7 +229,7 @@ pub async fn send_command(
 ) -> std::io::Result<String> {
     use transport::LegacyTransport;
 
-    let mut transport = LegacyTransport::new(target, port, command_timeout);
+    let transport = LegacyTransport::new(target, port, command_timeout);
     transport
         .send(command)
         .await
