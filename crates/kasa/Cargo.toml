@@ -1,6 +1,6 @@
 [package]
 name = "kasa"
-version = "0.4.0"
+version = "0.5.0"
 description = "CLI for communicating with TP-Link Kasa smart devices"
 readme = "README.md"
 edition.workspace = true
