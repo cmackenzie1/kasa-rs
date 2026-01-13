@@ -68,6 +68,7 @@ use tracing::debug;
 pub mod commands;
 pub mod credentials;
 pub mod crypto;
+pub mod discovery;
 pub mod error;
 pub mod transport;
 
