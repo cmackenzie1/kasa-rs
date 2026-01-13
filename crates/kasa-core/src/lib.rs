@@ -70,10 +70,12 @@ pub mod credentials;
 pub mod crypto;
 pub mod discovery;
 pub mod error;
+pub mod response;
 pub mod transport;
 
 // Re-exports for convenience
 pub use credentials::Credentials;
+pub use discovery::DiscoveredDevice;
 pub use error::Error;
 pub use transport::{DeviceConfig, EncryptionType, Transport, connect};
 
@@ -101,40 +103,6 @@ pub const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Broadcast address for UDP discovery.
 const BROADCAST_ADDR: &str = "255.255.255.255:9999";
-
-/// Information about a discovered Kasa device.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredDevice {
-    /// IP address of the device.
-    pub ip: IpAddr,
-    /// TCP port (typically 9999 for legacy, 80 for KLAP).
-    pub port: u16,
-    /// Device alias/name set by the user.
-    pub alias: String,
-    /// Device model (e.g., "HS103", "KP115").
-    pub model: String,
-    /// MAC address of the device.
-    pub mac: String,
-    /// Unique device ID.
-    pub device_id: String,
-    /// Hardware version.
-    pub hw_ver: String,
-    /// Software/firmware version.
-    pub sw_ver: String,
-    /// Current relay state (true = on, false = off).
-    pub relay_state: bool,
-    /// Whether the LED is off.
-    pub led_off: bool,
-    /// WiFi signal strength in dBm.
-    pub rssi: i32,
-    /// Seconds since the relay was turned on (0 if off).
-    pub on_time: u64,
-    /// Whether a firmware update is in progress.
-    pub updating: bool,
-    /// Detected encryption type (if known).
-    #[serde(default)]
-    pub encryption_type: EncryptionType,
-}
 
 /// Security type for WiFi networks.
 ///
@@ -214,47 +182,6 @@ pub struct BroadcastResult {
     /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Response structure for parsing sysinfo from devices.
-#[derive(Debug, Deserialize)]
-struct SysInfoResponse {
-    system: SystemWrapper,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemWrapper {
-    get_sysinfo: SysInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct SysInfo {
-    alias: String,
-    model: String,
-    #[serde(default)]
-    mac: String,
-    #[serde(rename = "deviceId", default)]
-    device_id: String,
-    #[allow(dead_code)]
-    #[serde(rename = "hwId", default)]
-    hw_id: String,
-    #[serde(rename = "hw_ver", default)]
-    hw_ver: String,
-    #[serde(rename = "sw_ver", default)]
-    sw_ver: String,
-    #[serde(default)]
-    relay_state: u8,
-    #[serde(default)]
-    led_off: u8,
-    // Some devices use mic_mac instead of mac
-    #[serde(rename = "mic_mac", default)]
-    mic_mac: String,
-    #[serde(default)]
-    rssi: i32,
-    #[serde(default)]
-    on_time: u64,
-    #[serde(default)]
-    updating: u8,
 }
 
 /// Sends a command to a TP-Link Kasa device using the legacy XOR protocol.
@@ -362,29 +289,28 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                 let decrypted = decrypt(&buf[..n]);
                 debug!("Decrypted response: {}", decrypted);
 
-                if let Ok(response) = serde_json::from_str::<SysInfoResponse>(&decrypted) {
+                if let Ok(response) = serde_json::from_str::<response::SysInfoResponse>(&decrypted)
+                {
                     let info = response.system.get_sysinfo;
-                    let mac = if info.mac.is_empty() {
-                        info.mic_mac.clone()
-                    } else {
-                        info.mac.clone()
-                    };
 
                     devices.push(DiscoveredDevice {
                         ip: addr.ip(),
                         port: DEFAULT_PORT,
+                        mac: info.mac_address().to_string(),
+                        relay_state: info.is_on(),
+                        led_off: info.is_led_off(),
+                        updating: info.is_updating(),
+                        rssi: info.rssi,
+                        on_time: info.on_time,
                         alias: info.alias,
                         model: info.model,
-                        mac,
                         device_id: info.device_id,
                         hw_ver: info.hw_ver,
                         sw_ver: info.sw_ver,
-                        relay_state: info.relay_state == 1,
-                        led_off: info.led_off == 1,
-                        rssi: info.rssi,
-                        on_time: info.on_time,
-                        updating: info.updating == 1,
                         encryption_type: EncryptionType::Xor, // Legacy discovery
+                        http_port: None,
+                        new_klap: None,
+                        login_version: None,
                     });
                 }
             }
