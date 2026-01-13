@@ -848,6 +848,7 @@ version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
+ "futures",
  "kasa-core",
  "prometheus-client",
  "serde_json",
