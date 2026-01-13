@@ -330,10 +330,10 @@ impl CloudInfo {
 
 /// Response wrapper for batched energy meter queries on power strips.
 ///
-/// When querying energy for multiple children in a single request, the device
-/// returns an array of readings in the same order as the requested child IDs.
-///
-/// This is the top-level response from a batched emeter query with multiple child_ids.
+/// **Note:** Most TP-Link devices do not actually support batching - they only
+/// process the first child ID. This type is kept for potential future device
+/// compatibility but is not used by current implementations.
+#[doc(hidden)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BatchEmeterResponse {
     /// The emeter wrapper containing the array of realtime readings.
@@ -341,6 +341,7 @@ pub struct BatchEmeterResponse {
 }
 
 /// Wrapper for batched get_realtime responses.
+#[doc(hidden)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BatchEmeterWrapper {
     /// Array of energy readings, one per child in the request order.

@@ -230,10 +230,11 @@ pub fn relay_off_for_child(child_id: &str) -> String {
     with_child_context(child_id, r#""system":{"set_relay_state":{"state":0}}"#)
 }
 
-/// Generate a batched energy reading command for multiple child plugs.
+/// Generate an energy reading command with multiple child IDs in context.
 ///
-/// This sends a single request that retrieves energy data for all specified
-/// children, significantly reducing network round trips for power strips.
+/// **Note:** Most TP-Link devices (including HS300) do not actually support
+/// batching - they only process the first child ID and ignore the rest.
+/// Use [`energy_for_child`] in a loop instead for reliable results.
 ///
 /// # Arguments
 ///
@@ -251,11 +252,7 @@ pub fn relay_off_for_child(child_id: &str) -> String {
 /// assert!(cmd.contains("plug1"));
 /// assert!(cmd.contains("plug2"));
 /// ```
-///
-/// # Response Format
-///
-/// The response contains an array of energy readings in the same order as the
-/// child IDs provided. Use [`crate::response::BatchEmeterResponse`] to parse.
+#[doc(hidden)]
 pub fn energy_for_children(child_ids: &[impl AsRef<str>]) -> String {
     let ids_json: Vec<String> = child_ids
         .iter()

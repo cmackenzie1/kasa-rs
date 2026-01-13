@@ -19,6 +19,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -77,8 +78,8 @@ impl Default for TpapInfo {
 struct TpapSession {
     /// Session ID (stok) from device.
     session_id: String,
-    /// Current sequence number.
-    seq: u32,
+    /// Current sequence number (atomic for concurrent access).
+    seq: AtomicU32,
     /// AEAD cipher for encryption/decryption.
     cipher: TpapSessionCipher,
 }
@@ -377,7 +378,7 @@ impl TpapTransport {
 
         self.session = Some(TpapSession {
             session_id,
-            seq: start_seq,
+            seq: AtomicU32::new(start_seq),
             cipher,
         });
 
@@ -404,15 +405,14 @@ impl TpapTransport {
     }
 
     /// Send an encrypted request to the device.
-    async fn send_encrypted(&mut self, command: &str) -> Result<String, Error> {
+    async fn send_encrypted(&self, command: &str) -> Result<String, Error> {
         let session = self
             .session
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| Error::Protocol("No active session".into()))?;
 
-        // Increment sequence
-        let seq = session.seq;
-        session.seq = session.seq.wrapping_add(1);
+        // Atomically get and increment sequence number
+        let seq = session.seq.fetch_add(1, Ordering::SeqCst);
 
         // Encrypt command
         let encrypted = session
@@ -436,7 +436,6 @@ impl TpapTransport {
         .map_err(|e| Error::IoError(format!("Task join error: {}", e)))??;
 
         // Decrypt response
-        let session = self.session.as_ref().unwrap();
         let decrypted = session
             .cipher
             .decrypt(&response, seq)
@@ -449,7 +448,7 @@ impl TpapTransport {
 
 #[async_trait]
 impl Transport for TpapTransport {
-    async fn send(&mut self, command: &str) -> Result<String, Error> {
+    async fn send(&self, command: &str) -> Result<String, Error> {
         self.send_encrypted(command).await
     }
 
