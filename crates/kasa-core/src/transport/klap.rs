@@ -70,26 +70,23 @@ enum AuthHash {
     V2([u8; 32]),
 }
 
-impl AuthHash {
-    /// Returns the auth hash as a hex string for logging.
-    fn hex(&self) -> String {
-        match self {
-            AuthHash::V1(h) => hex::encode(h),
-            AuthHash::V2(h) => hex::encode(h),
-        }
-    }
+/// Handshake algorithm version.
+///
+/// v1: `sha256(local_seed + auth_hash)` - used by older devices and IOT devices
+/// v2: `sha256(local_seed + remote_seed + auth_hash)` - used by SMART devices
+#[derive(Clone, Copy, Debug)]
+enum HandshakeVersion {
+    V1,
+    V2,
+}
 
+impl AuthHash {
     /// Returns the auth hash as a byte slice.
     fn as_bytes(&self) -> &[u8] {
         match self {
             AuthHash::V1(h) => h.as_slice(),
             AuthHash::V2(h) => h.as_slice(),
         }
-    }
-
-    /// Returns true if this is a v2 auth hash.
-    fn is_v2(&self) -> bool {
-        matches!(self, AuthHash::V2(_))
     }
 }
 
@@ -132,6 +129,8 @@ impl KlapTransport {
     /// Connects to a device using the KLAP protocol.
     ///
     /// This performs the two-phase handshake and establishes an encrypted session.
+    /// The implementation follows python-kasa's approach: perform handshake1 once,
+    /// then try multiple auth hash combinations against the server's response.
     ///
     /// # Arguments
     ///
@@ -159,134 +158,148 @@ impl KlapTransport {
 
         debug!(host, port, "Attempting KLAP connection");
 
-        // Build list of auth hashes to try
-        // For each credential set, we try both KLAP v1 (MD5-based) and v2 (SHA256-based)
-        let mut auth_attempts: Vec<(&str, AuthHash)> = Vec::new();
-
-        // User credentials - try v2 first (newer devices), then v1
-        let user_hash_v2 = generate_auth_hash_v2(&credentials);
-        let user_hash_v1 = generate_auth_hash(&credentials);
-        auth_attempts.push(("user (v2)", AuthHash::V2(user_hash_v2)));
-        auth_attempts.push(("user (v1)", AuthHash::V1(user_hash_v1)));
-
-        // Default credentials
-        for default_creds in DefaultCredentials::all() {
-            let creds = default_creds.credentials();
-            let hash_v2 = generate_auth_hash_v2(&creds);
-            let hash_v1 = generate_auth_hash(&creds);
-            let name_v2 = match default_creds {
-                DefaultCredentials::Kasa => "kasa default (v2)",
-                DefaultCredentials::Tapo => "tapo default (v2)",
-            };
-            let name_v1 = match default_creds {
-                DefaultCredentials::Kasa => "kasa default (v1)",
-                DefaultCredentials::Tapo => "tapo default (v1)",
-            };
-            auth_attempts.push((name_v2, AuthHash::V2(hash_v2)));
-            auth_attempts.push((name_v1, AuthHash::V1(hash_v1)));
-        }
-
-        // Blank credentials
-        if !credentials.is_blank() {
-            let blank_creds = Credentials::blank();
-            let blank_hash_v2 = generate_auth_hash_v2(&blank_creds);
-            let blank_hash_v1 = generate_auth_hash(&blank_creds);
-            auth_attempts.push(("blank (v2)", AuthHash::V2(blank_hash_v2)));
-            auth_attempts.push(("blank (v1)", AuthHash::V1(blank_hash_v1)));
-        }
-
-        // Try each auth hash
-        for (name, auth_hash) in auth_attempts {
-            debug!(
-                credential_type = name,
-                auth_hash = %auth_hash.hex(),
-                "Trying credentials"
-            );
-
-            match Self::try_handshake_with_auth(host, port, &auth_hash, timeout).await {
-                Ok((session, session_cookie)) => {
-                    debug!(credential_type = name, "KLAP handshake succeeded");
-                    return Ok(Self {
-                        host: host.to_string(),
-                        port,
-                        session: Arc::new(Mutex::new(session)),
-                        session_cookie,
-                        timeout,
-                    });
-                }
-                Err(e) => {
-                    debug!(credential_type = name, error = %e, "Credentials failed");
-                }
-            }
-        }
-
-        Err(Error::AuthenticationFailed(
-            "KLAP authentication failed with all credential sets (tried v1 and v2)".into(),
-        ))
-    }
-
-    /// Attempts a full handshake with the given auth hash (v1 or v2).
-    async fn try_handshake_with_auth(
-        host: &str,
-        port: u16,
-        auth_hash: &AuthHash,
-        io_timeout: Duration,
-    ) -> Result<(KlapEncryptionSession, String), Error> {
         // Generate random local seed
         let mut local_seed = [0u8; 16];
         rand::rng().fill_bytes(&mut local_seed);
 
-        // Handshake 1
+        // Perform handshake1 - this is done ONCE
         let (remote_seed, server_hash, session_cookie) =
-            Self::perform_handshake1(host, port, &local_seed, io_timeout).await?;
-
-        // Compute expected hash based on auth hash version
-        let (expected_hash, use_v2_handshake) = match auth_hash {
-            AuthHash::V1(h) => {
-                // KLAP v1: sha256(local_seed + auth_hash)
-                (handshake1_seed_auth_hash(&local_seed, h), false)
-            }
-            AuthHash::V2(h) => {
-                // KLAP v2: sha256(local_seed + remote_seed + auth_hash)
-                (
-                    handshake1_seed_auth_hash_v2(&local_seed, &remote_seed, h),
-                    true,
-                )
-            }
-        };
+            Self::perform_handshake1(host, port, &local_seed, timeout).await?;
 
         debug!(
-            auth_hash = %auth_hash.hex(),
-            is_v2 = auth_hash.is_v2(),
             local_seed = %hex::encode(local_seed),
             remote_seed = %hex::encode(remote_seed),
             server_hash = %hex::encode(server_hash),
-            expected_hash = %hex::encode(expected_hash),
-            "Verifying handshake1 hash"
+            "Handshake1 completed, trying auth hash combinations"
         );
 
-        if server_hash != expected_hash {
-            debug!(
-                server_hash = %hex::encode(server_hash),
-                expected = %hex::encode(expected_hash),
-                "Hash mismatch - credentials do not match device"
-            );
-            return Err(Error::AuthenticationFailed(
-                "Server hash does not match expected hash".into(),
-            ));
+        // Build list of credential sets to try
+        let mut credential_sets: Vec<(&str, Credentials)> = vec![("user", credentials.clone())];
+
+        // Add default credentials
+        for default_creds in DefaultCredentials::all() {
+            let creds = default_creds.credentials();
+            let name = match default_creds {
+                DefaultCredentials::Kasa => "kasa default",
+                DefaultCredentials::Tapo => "tapo default",
+            };
+            credential_sets.push((name, creds));
         }
 
-        debug!(is_v2 = use_v2_handshake, "Handshake1 hash verified");
+        // Add blank credentials if user credentials are not blank
+        if !credentials.is_blank() {
+            credential_sets.push(("blank", Credentials::blank()));
+        }
 
-        // Handshake 2 - use appropriate version
-        let handshake2_payload = if use_v2_handshake {
-            // KLAP v2: sha256(remote_seed + local_seed + auth_hash)
-            handshake2_seed_auth_hash_v2(&local_seed, &remote_seed, auth_hash.as_bytes())
-        } else {
-            // KLAP v1: sha256(remote_seed + auth_hash)
-            match auth_hash {
-                AuthHash::V1(h) => handshake2_seed_auth_hash(&remote_seed, h),
-                AuthHash::V2(_) => unreachable!("v2 auth hash should use v2 handshake"),
+        // For each credential set, try v2 and v1 auth hash combinations
+        // The order is: v2 auth + v2 handshake, v2 auth + v1 handshake, v1 auth + v1 handshake
+        for (cred_name, creds) in &credential_sets {
+            // Try v2 auth hash with v2 handshake (SMART.KLAP devices)
+            let auth_hash_v2 = AuthHash::V2(generate_auth_hash_v2(creds));
+            let expected_v2_v2 =
+                handshake1_seed_auth_hash_v2(&local_seed, &remote_seed, auth_hash_v2.as_bytes());
+
+            if server_hash == expected_v2_v2 {
+                debug!(
+                    credential_type = format!("{} (v2+v2)", cred_name),
+                    "Auth hash matched with v2 handshake"
+                );
+
+                return Self::complete_handshake(
+                    host,
+                    port,
+                    &local_seed,
+                    &remote_seed,
+                    &auth_hash_v2,
+                    HandshakeVersion::V2,
+                    &session_cookie,
+                    timeout,
+                )
+                .await;
+            }
+
+            // Try v2 auth hash with v1 handshake (IOT.KLAP with new firmware, e.g., HS300 v2.0)
+            let expected_v2_v1 = handshake1_seed_auth_hash(&local_seed, auth_hash_v2.as_bytes());
+
+            if server_hash == expected_v2_v1 {
+                debug!(
+                    credential_type = format!("{} (v2+v1)", cred_name),
+                    "Auth hash matched with v1 handshake"
+                );
+
+                return Self::complete_handshake(
+                    host,
+                    port,
+                    &local_seed,
+                    &remote_seed,
+                    &auth_hash_v2,
+                    HandshakeVersion::V1,
+                    &session_cookie,
+                    timeout,
+                )
+                .await;
+            }
+
+            // Try v1 auth hash with v1 handshake (legacy IOT.KLAP)
+            let auth_hash_v1 = AuthHash::V1(generate_auth_hash(creds));
+            let expected_v1_v1 = handshake1_seed_auth_hash(&local_seed, auth_hash_v1.as_bytes());
+
+            if server_hash == expected_v1_v1 {
+                debug!(
+                    credential_type = format!("{} (v1+v1)", cred_name),
+                    "Auth hash matched with v1 handshake"
+                );
+
+                return Self::complete_handshake(
+                    host,
+                    port,
+                    &local_seed,
+                    &remote_seed,
+                    &auth_hash_v1,
+                    HandshakeVersion::V1,
+                    &session_cookie,
+                    timeout,
+                )
+                .await;
+            }
+        }
+
+        // Log all attempted hashes for debugging
+        debug!(
+            server_hash = %hex::encode(server_hash),
+            "No auth hash combination matched server response"
+        );
+
+        Err(Error::AuthenticationFailed(
+            "KLAP authentication failed: device response did not match any credential combination. \
+             Check that your email and password (both case-sensitive) are correct."
+                .into(),
+        ))
+    }
+
+    /// Completes the handshake after finding a matching auth hash.
+    ///
+    /// This performs handshake2 and creates the encryption session.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_handshake(
+        host: &str,
+        port: u16,
+        local_seed: &[u8; 16],
+        remote_seed: &[u8; 16],
+        auth_hash: &AuthHash,
+        handshake_version: HandshakeVersion,
+        session_cookie: &str,
+        io_timeout: Duration,
+    ) -> Result<Self, Error> {
+        // Compute handshake2 payload based on handshake version
+        let handshake2_payload = match handshake_version {
+            HandshakeVersion::V1 => {
+                // v1 handshake2: sha256(remote_seed + auth_hash)
+                handshake2_seed_auth_hash(remote_seed, auth_hash.as_bytes())
+            }
+            HandshakeVersion::V2 => {
+                // v2 handshake2: sha256(remote_seed + local_seed + auth_hash)
+                handshake2_seed_auth_hash_v2(local_seed, remote_seed, auth_hash.as_bytes())
             }
         };
 
@@ -294,15 +307,28 @@ impl KlapTransport {
             host,
             port,
             &handshake2_payload,
-            &session_cookie,
+            session_cookie,
             io_timeout,
         )
         .await?;
 
         // Create encryption session
-        let session = KlapEncryptionSession::new(&local_seed, &remote_seed, auth_hash.as_bytes());
+        let session = KlapEncryptionSession::new(local_seed, remote_seed, auth_hash.as_bytes());
 
-        Ok((session, session_cookie))
+        debug!(
+            host,
+            port,
+            handshake_version = ?handshake_version,
+            "KLAP handshake completed successfully"
+        );
+
+        Ok(Self {
+            host: host.to_string(),
+            port,
+            session: Arc::new(Mutex::new(session)),
+            session_cookie: session_cookie.to_string(),
+            timeout: io_timeout,
+        })
     }
 
     /// Sends a raw HTTP POST request and returns the response.
