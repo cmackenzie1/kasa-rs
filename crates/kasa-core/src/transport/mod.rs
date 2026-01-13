@@ -285,9 +285,36 @@ async fn try_legacy(config: &DeviceConfig) -> Result<LegacyTransport, Error> {
 /// This trait abstracts over different transport protocols (legacy XOR, KLAP)
 /// to provide a unified interface for sending commands to devices.
 ///
-/// All methods take `&self` (not `&mut self`) to allow concurrent requests
-/// on the same transport. Internal state like sequence numbers is managed
-/// using atomic operations.
+/// # Concurrency
+///
+/// All methods take `&self` to allow sharing a transport across async tasks.
+/// However, **requests to a single device must be sequential** - TP-Link devices
+/// cannot handle concurrent requests and will return errors if multiple requests
+/// arrive simultaneously.
+///
+/// When communicating with **multiple devices**, you can safely run operations
+/// concurrently, with each device's requests being sequential:
+///
+/// ```no_run
+/// use kasa_core::transport::{DeviceConfig, connect, TransportExt};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // Connect to multiple devices
+///     let transport1 = connect(DeviceConfig::new("192.168.1.100")).await?;
+///     let transport2 = connect(DeviceConfig::new("192.168.1.101")).await?;
+///     
+///     // Query devices concurrently (each device handles one request at a time)
+///     let (info1, info2) = tokio::join!(
+///         transport1.get_sysinfo(),
+///         transport2.get_sysinfo(),
+///     );
+///     
+///     println!("Device 1: {:?}", info1?.alias);
+///     println!("Device 2: {:?}", info2?.alias);
+///     Ok(())
+/// }
+/// ```
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Sends a JSON command to the device and returns the response.
@@ -299,6 +326,12 @@ pub trait Transport: Send + Sync {
     /// # Returns
     ///
     /// The JSON response from the device, or an error.
+    ///
+    /// # Concurrency
+    ///
+    /// While this method takes `&self`, **do not call it concurrently** on the
+    /// same transport. TP-Link devices can only process one request at a time.
+    /// Concurrent calls will result in errors or corrupted responses.
     async fn send(&self, command: &str) -> Result<String, Error>;
 
     /// Returns the encryption type used by this transport.
@@ -323,7 +356,7 @@ pub trait Transport: Send + Sync {
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let mut transport = connect(DeviceConfig::new("192.168.1.100")).await?;
+///     let transport = connect(DeviceConfig::new("192.168.1.100")).await?;
 ///     
 ///     // Get device info with typed response
 ///     let sysinfo = transport.get_sysinfo().await?;
@@ -342,6 +375,11 @@ pub trait Transport: Send + Sync {
 ///     Ok(())
 /// }
 /// ```
+///
+/// # Concurrency Note
+///
+/// While methods take `&self`, requests to a single device must be sequential.
+/// See [`Transport`] documentation for details on concurrent access patterns.
 #[async_trait]
 pub trait TransportExt: Transport {
     /// Gets device system information.
@@ -398,9 +436,9 @@ pub trait TransportExt: Transport {
 
     /// Gets energy meter readings for all child plugs.
     ///
-    /// Makes sequential requests for each child plug. For power strips with
-    /// many plugs, consider using this method to get all readings at once
-    /// rather than calling [`get_energy_for_child`](Self::get_energy_for_child) in a loop.
+    /// Makes **sequential** requests for each child plug. This is necessary because
+    /// TP-Link devices cannot handle concurrent requests - they will return errors
+    /// if multiple requests arrive simultaneously.
     ///
     /// # Arguments
     ///
@@ -409,6 +447,8 @@ pub trait TransportExt: Transport {
     /// # Returns
     ///
     /// A vector of energy readings in the same order as the provided child IDs.
+    /// If a request fails for a particular child, a default [`EnergyReading`](crate::response::EnergyReading)
+    /// is returned for that slot to maintain index alignment.
     async fn get_energy_for_children(
         &self,
         child_ids: &[&str],
