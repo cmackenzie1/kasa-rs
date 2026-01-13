@@ -393,7 +393,22 @@ async fn poll_device_with_transport(
             sysinfo.children.len()
         );
 
-        // Set per-plug state from sysinfo
+        // Collect child IDs for batched energy query
+        let child_ids: Vec<&str> = sysinfo.children.iter().map(|c| c.id.as_str()).collect();
+
+        // Get energy data for all plugs in a single request
+        let energy_readings = match transport.get_energy_for_children(&child_ids).await {
+            Ok(readings) => readings,
+            Err(e) => {
+                debug!(
+                    "Failed to get batched energy data from {}: {}",
+                    updated_device.alias, e
+                );
+                Vec::new()
+            }
+        };
+
+        // Set per-plug state and energy metrics
         for (slot, child) in sysinfo.children.iter().enumerate() {
             let labels = PlugLabels {
                 device_id: updated_device.device_id.clone(),
@@ -408,17 +423,9 @@ async fn poll_device_with_transport(
             state.metrics.set_plug_relay_state(&labels, child.is_on());
             state.metrics.set_plug_on_time(&labels, child.on_time);
 
-            // Get energy data for this plug using TransportExt
-            match transport.get_energy_for_child(&child.id).await {
-                Ok(reading) => {
-                    set_plug_energy_metrics(state, &labels, &reading);
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to get energy data from {} plug {}: {}",
-                        updated_device.alias, slot, e
-                    );
-                }
+            // Use energy reading from batched response if available
+            if let Some(reading) = energy_readings.get(slot) {
+                set_plug_energy_metrics(state, &labels, reading);
             }
         }
 

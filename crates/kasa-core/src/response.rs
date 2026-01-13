@@ -328,6 +328,25 @@ impl CloudInfo {
     }
 }
 
+/// Response wrapper for batched energy meter queries on power strips.
+///
+/// When querying energy for multiple children in a single request, the device
+/// returns an array of readings in the same order as the requested child IDs.
+///
+/// This is the top-level response from a batched emeter query with multiple child_ids.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BatchEmeterResponse {
+    /// The emeter wrapper containing the array of realtime readings.
+    pub emeter: BatchEmeterWrapper,
+}
+
+/// Wrapper for batched get_realtime responses.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BatchEmeterWrapper {
+    /// Array of energy readings, one per child in the request order.
+    pub get_realtime: Vec<EnergyReading>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

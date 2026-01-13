@@ -229,3 +229,41 @@ pub fn relay_on_for_child(child_id: &str) -> String {
 pub fn relay_off_for_child(child_id: &str) -> String {
     with_child_context(child_id, r#""system":{"set_relay_state":{"state":0}}"#)
 }
+
+/// Generate a batched energy reading command for multiple child plugs.
+///
+/// This sends a single request that retrieves energy data for all specified
+/// children, significantly reducing network round trips for power strips.
+///
+/// # Arguments
+///
+/// * `child_ids` - Slice of child plug IDs (from sysinfo children array)
+///
+/// # Example
+///
+/// ```
+/// use kasa_core::commands;
+///
+/// let ids = ["plug0", "plug1", "plug2"];
+/// let cmd = commands::energy_for_children(&ids);
+/// assert!(cmd.contains("emeter"));
+/// assert!(cmd.contains("plug0"));
+/// assert!(cmd.contains("plug1"));
+/// assert!(cmd.contains("plug2"));
+/// ```
+///
+/// # Response Format
+///
+/// The response contains an array of energy readings in the same order as the
+/// child IDs provided. Use [`crate::response::BatchEmeterResponse`] to parse.
+pub fn energy_for_children(child_ids: &[impl AsRef<str>]) -> String {
+    let ids_json: Vec<String> = child_ids
+        .iter()
+        .map(|id| format!(r#""{}""#, id.as_ref()))
+        .collect();
+
+    format!(
+        r#"{{"context":{{"child_ids":[{}]}},"emeter":{{"get_realtime":{{}}}}}}"#,
+        ids_json.join(",")
+    )
+}
