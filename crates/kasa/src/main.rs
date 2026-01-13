@@ -1,7 +1,10 @@
 use std::{io::IsTerminal, time::Duration};
 
 use clap::{Parser, Subcommand};
-use kasa_core::{DEFAULT_PORT, broadcast, commands, discover, send_command};
+use kasa_core::{
+    Credentials, DEFAULT_PORT, broadcast, commands, discover, send_command,
+    transport::{DeviceConfig, connect},
+};
 use tracing::{debug, error};
 
 // Source - https://stackoverflow.com/a/77615625
@@ -19,6 +22,17 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// TP-Link cloud account username (email).
+    /// Required for devices with newer firmware (KLAP protocol).
+    /// Can also be set via KASA_USERNAME environment variable.
+    #[arg(short, long, global = true, env = "KASA_USERNAME")]
+    username: Option<String>,
+
+    /// Read password from stdin.
+    /// Useful for scripting: echo "password" | kasa -u user@example.com --password-stdin device 192.168.1.100 info
+    #[arg(long, global = true)]
+    password_stdin: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -41,9 +55,9 @@ enum Command {
         /// Target hostname or IP address
         target: String,
 
-        /// Target port
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Target port (default: auto-detect based on protocol)
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Timeout in seconds to establish connection
         #[arg(long, value_parser = parse_duration, default_value = "10")]
@@ -54,6 +68,11 @@ enum Command {
         /// Can be the full ID or just the slot number (0-5).
         #[arg(long)]
         plug: Option<String>,
+
+        /// Force legacy protocol (XOR on port 9999).
+        /// Use this to skip KLAP protocol detection.
+        #[arg(long)]
+        legacy: bool,
 
         #[command(subcommand)]
         command: DeviceCommand,
@@ -327,6 +346,29 @@ fn read_password(
     }
 }
 
+/// Get credentials from CLI options and environment.
+///
+/// Password is read from KASA_PASSWORD env var, stdin (if --password-stdin),
+/// or interactively prompted.
+fn get_credentials(
+    username: Option<String>,
+    password_stdin: bool,
+) -> Result<Option<Credentials>, String> {
+    let Some(user) = username else {
+        return Ok(None);
+    };
+
+    // Check KASA_PASSWORD env var first
+    if let Ok(pass) = std::env::var("KASA_PASSWORD") {
+        return Ok(Some(Credentials::new(user, pass)));
+    }
+
+    // Read password via stdin or prompt
+    let prompt = format!("Password for {}", user);
+    let pass = read_password(password_stdin, None, &prompt)?;
+    Ok(Some(Credentials::new(user, pass)))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -361,143 +403,85 @@ async fn main() {
             port,
             timeout,
             plug,
+            legacy,
             command,
         } => {
-            // Resolve plug ID if specified
-            let child_id = match &plug {
-                Some(plug_arg) => {
-                    // Check if it's a slot number (0-9) or a full ID
-                    if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
-                        // It's a slot number, need to fetch sysinfo to get the full ID
-                        let slot: usize = plug_arg.parse().unwrap_or_else(|_| {
-                            eprintln!("Error: Invalid plug number: {}", plug_arg);
-                            std::process::exit(1);
-                        });
-
-                        debug!("Resolving plug slot {} to child ID", slot);
-                        match send_command(&target, port, timeout, commands::INFO).await {
-                            Ok(response) => {
-                                match serde_json::from_str::<serde_json::Value>(&response) {
-                                    Ok(json) => {
-                                        let children = json
-                                            .get("system")
-                                            .and_then(|s| s.get("get_sysinfo"))
-                                            .and_then(|s| s.get("children"))
-                                            .and_then(|c| c.as_array());
-
-                                        match children {
-                                            Some(children) => {
-                                                if slot >= children.len() {
-                                                    eprintln!(
-                                                        "Error: Plug {} not found. Device has {} plugs (0-{})",
-                                                        slot,
-                                                        children.len(),
-                                                        children.len() - 1
-                                                    );
-                                                    std::process::exit(1);
-                                                }
-                                                children[slot]
-                                                    .get("id")
-                                                    .and_then(|id| id.as_str())
-                                                    .map(|s| s.to_string())
-                                                    .unwrap_or_else(|| {
-                                                        eprintln!("Error: Plug {} has no ID", slot);
-                                                        std::process::exit(1);
-                                                    })
-                                            }
-                                            None => {
-                                                eprintln!(
-                                                    "Error: Device does not have child plugs. \
-                                                    The --plug option is only for power strips."
-                                                );
-                                                std::process::exit(1);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Error: Failed to parse sysinfo: {}", e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error: Failed to get sysinfo: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else {
-                        // It's a full child ID
-                        plug_arg.clone()
-                    }
+            // Get credentials if provided
+            let credentials = match get_credentials(cli.username.clone(), cli.password_stdin) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
                 }
-                None => String::new(),
             };
 
-            let command_json = if !child_id.is_empty() {
-                // Wrap command with child context
-                match &command {
-                    DeviceCommand::Energy => commands::energy_for_child(&child_id),
-                    DeviceCommand::On => commands::relay_on_for_child(&child_id),
-                    DeviceCommand::Off => commands::relay_off_for_child(&child_id),
-                    _ => {
-                        // For other commands, check if they can be wrapped
-                        match command.to_command_json() {
-                            CommandJson::Static(s) => {
-                                // Extract inner content from static command
-                                // e.g., {"emeter":{"get_realtime":{}}} -> "emeter":{"get_realtime":{}}
-                                let inner = s.trim_start_matches('{').trim_end_matches('}');
-                                commands::with_child_context(&child_id, inner)
-                            }
-                            CommandJson::Dynamic(s) => {
-                                let inner = s.trim_start_matches('{').trim_end_matches('}');
-                                commands::with_child_context(&child_id, inner)
-                            }
-                            CommandJson::Special(SpecialCommand::CloudBind { .. }) => {
-                                eprintln!("Error: cloud-bind command cannot be used with --plug");
-                                std::process::exit(1);
-                            }
-                        }
+            // Build the command JSON
+            let command_json = build_command_json(
+                &command,
+                &plug,
+                &target,
+                port,
+                timeout,
+                legacy,
+                &credentials,
+            )
+            .await;
+
+            // Send command using appropriate transport
+            if legacy {
+                // Force legacy protocol
+                let port = port.unwrap_or(DEFAULT_PORT);
+                debug!("Using legacy protocol on port {}", port);
+                match send_command(&target, port, timeout, &command_json).await {
+                    Ok(response) => print_json_response(&response),
+                    Err(e) => {
+                        error!("Could not connect to host {}:{}: {}", target, port, e);
+                        eprintln!(
+                            "Error: Could not connect to host {}:{}: {}",
+                            target, port, e
+                        );
+                        std::process::exit(1);
                     }
                 }
             } else {
-                match command.to_command_json() {
-                    CommandJson::Static(s) => s.to_string(),
-                    CommandJson::Dynamic(s) => s,
-                    CommandJson::Special(SpecialCommand::CloudBind {
-                        username,
-                        password_stdin,
-                        password,
-                    }) => {
-                        let prompt = format!("Password for {}", username);
-                        let pass = match read_password(password_stdin, password, &prompt) {
-                            Ok(p) => p,
+                // Auto-detect protocol
+                let mut config = DeviceConfig::new(&target).with_timeout(timeout);
+                if let Some(p) = port {
+                    config = config.with_port(p);
+                }
+                if let Some(creds) = credentials {
+                    config = config.with_credentials(creds);
+                }
+
+                debug!("Connecting to {} with auto-detection", target);
+                match connect(config).await {
+                    Ok(mut transport) => {
+                        debug!(
+                            "Connected using {} protocol on port {}",
+                            transport.encryption_type(),
+                            transport.port()
+                        );
+                        match transport.send(&command_json).await {
+                            Ok(response) => print_json_response(&response),
                             Err(e) => {
-                                eprintln!("Error: {}", e);
+                                error!("Command failed: {}", e);
+                                eprintln!("Error: Command failed: {}", e);
                                 std::process::exit(1);
                             }
-                        };
-                        commands::cloud_bind(&username, &pass)
+                        }
                     }
-                }
-            };
-
-            debug!("Command: {}", command_json);
-
-            match send_command(&target, port, timeout, &command_json).await {
-                Ok(response) => {
-                    // Validate it's proper JSON and output
-                    match serde_json::from_str::<serde_json::Value>(&response) {
-                        Ok(json) => println!("{}", json),
-                        Err(_) => println!("{}", response),
+                    Err(e) => {
+                        error!("Could not connect to {}: {}", target, e);
+                        eprintln!("Error: Could not connect to {}: {}", target, e);
+                        eprintln!();
+                        eprintln!("If your device has newer firmware (KLAP protocol), try:");
+                        eprintln!("  kasa -u your-email@example.com device {} info", target);
+                        eprintln!();
+                        eprintln!("Or set credentials via environment variables:");
+                        eprintln!("  export KASA_USERNAME=your-email@example.com");
+                        eprintln!("  export KASA_PASSWORD=your-password");
+                        std::process::exit(1);
                     }
-                }
-                Err(e) => {
-                    error!("Could not connect to host {}:{}: {}", target, port, e);
-                    eprintln!(
-                        "Error: Could not connect to host {}:{}: {}",
-                        target, port, e
-                    );
-                    std::process::exit(1);
                 }
             }
         }
@@ -683,6 +667,140 @@ async fn main() {
                 }
             }
         },
+    }
+}
+
+/// Build the command JSON, resolving plug IDs if needed.
+async fn build_command_json(
+    command: &DeviceCommand,
+    plug: &Option<String>,
+    target: &str,
+    port: Option<u16>,
+    timeout: Duration,
+    legacy: bool,
+    _credentials: &Option<Credentials>,
+) -> String {
+    // Resolve plug ID if specified
+    let child_id = match plug {
+        Some(plug_arg) => {
+            // Check if it's a slot number (0-9) or a full ID
+            if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
+                // It's a slot number, need to fetch sysinfo to get the full ID
+                let slot: usize = plug_arg.parse().unwrap_or_else(|_| {
+                    eprintln!("Error: Invalid plug number: {}", plug_arg);
+                    std::process::exit(1);
+                });
+
+                debug!("Resolving plug slot {} to child ID", slot);
+                let port = port.unwrap_or(if legacy { DEFAULT_PORT } else { 80 });
+                match send_command(target, port, timeout, commands::INFO).await {
+                    Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                        Ok(json) => {
+                            let children = json
+                                .get("system")
+                                .and_then(|s| s.get("get_sysinfo"))
+                                .and_then(|s| s.get("children"))
+                                .and_then(|c| c.as_array());
+
+                            match children {
+                                Some(children) => {
+                                    if slot >= children.len() {
+                                        eprintln!(
+                                            "Error: Plug {} not found. Device has {} plugs (0-{})",
+                                            slot,
+                                            children.len(),
+                                            children.len() - 1
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                    children[slot]
+                                        .get("id")
+                                        .and_then(|id| id.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| {
+                                            eprintln!("Error: Plug {} has no ID", slot);
+                                            std::process::exit(1);
+                                        })
+                                }
+                                None => {
+                                    eprintln!(
+                                        "Error: Device does not have child plugs. \
+                                            The --plug option is only for power strips."
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to parse sysinfo: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Error: Failed to get sysinfo: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // It's a full child ID
+                plug_arg.clone()
+            }
+        }
+        None => String::new(),
+    };
+
+    if !child_id.is_empty() {
+        // Wrap command with child context
+        match command {
+            DeviceCommand::Energy => commands::energy_for_child(&child_id),
+            DeviceCommand::On => commands::relay_on_for_child(&child_id),
+            DeviceCommand::Off => commands::relay_off_for_child(&child_id),
+            _ => {
+                // For other commands, check if they can be wrapped
+                match command.to_command_json() {
+                    CommandJson::Static(s) => {
+                        let inner = s.trim_start_matches('{').trim_end_matches('}');
+                        commands::with_child_context(&child_id, inner)
+                    }
+                    CommandJson::Dynamic(s) => {
+                        let inner = s.trim_start_matches('{').trim_end_matches('}');
+                        commands::with_child_context(&child_id, inner)
+                    }
+                    CommandJson::Special(SpecialCommand::CloudBind { .. }) => {
+                        eprintln!("Error: cloud-bind command cannot be used with --plug");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    } else {
+        match command.to_command_json() {
+            CommandJson::Static(s) => s.to_string(),
+            CommandJson::Dynamic(s) => s,
+            CommandJson::Special(SpecialCommand::CloudBind {
+                username,
+                password_stdin,
+                password,
+            }) => {
+                let prompt = format!("Password for {}", username);
+                let pass = match read_password(password_stdin, password, &prompt) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                commands::cloud_bind(&username, &pass)
+            }
+        }
+    }
+}
+
+/// Print a JSON response, validating it first.
+fn print_json_response(response: &str) {
+    match serde_json::from_str::<serde_json::Value>(response) {
+        Ok(json) => println!("{}", json),
+        Err(_) => println!("{}", response),
     }
 }
 
