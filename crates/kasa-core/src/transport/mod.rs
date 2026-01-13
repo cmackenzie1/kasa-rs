@@ -67,6 +67,10 @@ pub struct DeviceConfig {
     pub timeout: Duration,
     /// Use HTTPS instead of HTTP for KLAP.
     pub https: bool,
+    /// Hint about which encryption protocol to try first.
+    /// When set (e.g., from discovery), `connect()` will try this protocol first
+    /// before falling back to auto-detection.
+    pub encryption_hint: Option<EncryptionType>,
 }
 
 impl DeviceConfig {
@@ -78,6 +82,7 @@ impl DeviceConfig {
             credentials: None,
             timeout: DEFAULT_TIMEOUT,
             https: false,
+            encryption_hint: None,
         }
     }
 
@@ -105,6 +110,16 @@ impl DeviceConfig {
         self
     }
 
+    /// Sets a hint about which encryption protocol to try first.
+    ///
+    /// When set, `connect()` will attempt the hinted protocol first before
+    /// falling back to auto-detection. This improves connection speed when
+    /// the protocol is already known (e.g., from discovery).
+    pub fn with_encryption_hint(mut self, hint: EncryptionType) -> Self {
+        self.encryption_hint = Some(hint);
+        self
+    }
+
     /// Creates a device configuration from a discovered device.
     ///
     /// This sets the host and port based on discovery results, allowing
@@ -121,7 +136,9 @@ impl DeviceConfig {
     /// }
     /// ```
     pub fn from_discovered(device: &DiscoveredDevice) -> Self {
-        Self::new(device.ip.to_string()).with_port(device.port)
+        Self::new(device.ip.to_string())
+            .with_port(device.port)
+            .with_encryption_hint(device.encryption_type)
     }
 }
 
@@ -157,7 +174,36 @@ impl DeviceConfig {
 /// }
 /// ```
 pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> {
-    // If credentials are provided, try authenticated protocols
+    // If we have an encryption hint from discovery, try that protocol first
+    if let Some(hint) = config.encryption_hint {
+        tracing::debug!("Using encryption hint: {}", hint);
+        match hint {
+            EncryptionType::Xor => {
+                if let Ok(transport) = try_legacy(&config).await {
+                    return Ok(Box::new(transport));
+                }
+                tracing::debug!("Hinted XOR protocol failed, trying other protocols");
+            }
+            EncryptionType::Klap => {
+                if let Ok(transport) = try_klap(&config).await {
+                    return Ok(Box::new(transport));
+                }
+                tracing::debug!("Hinted KLAP protocol failed, trying other protocols");
+            }
+            EncryptionType::Tpap => {
+                if let Ok(transport) = try_tpap(&config).await {
+                    return Ok(Box::new(transport));
+                }
+                tracing::debug!("Hinted TPAP protocol failed, trying other protocols");
+            }
+            EncryptionType::Aes => {
+                // AES (Tapo) not yet implemented, fall through to auto-detection
+                tracing::debug!("AES protocol not yet supported, trying other protocols");
+            }
+        }
+    }
+
+    // Auto-detect protocol: try authenticated protocols first if credentials provided
     if config.credentials.is_some() {
         // Try TPAP first (newer firmware on port 4433)
         match try_tpap(&config).await {
