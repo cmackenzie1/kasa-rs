@@ -198,10 +198,18 @@ async fn poll_devices(
                     info!("Discovered {} devices", devices.len());
                     state.metrics.set_devices_discovered(devices.len());
 
-                    // Poll each device for additional data (energy, cloud status)
-                    for device in devices {
-                        poll_discovered_device(&state, &device, command_timeout).await;
-                    }
+                    // Poll all devices concurrently
+                    let futures: Vec<_> = devices
+                        .iter()
+                        .map(|device| {
+                            let state = Arc::clone(&state);
+                            let device = device.clone();
+                            async move {
+                                poll_discovered_device(&state, &device, command_timeout).await;
+                            }
+                        })
+                        .collect();
+                    futures::future::join_all(futures).await;
                 }
                 Err(e) => {
                     error!("Discovery failed: {}", e);
@@ -209,15 +217,23 @@ async fn poll_devices(
                 }
             }
         } else {
-            // Targeted mode - poll specific IPs
+            // Targeted mode - poll specific IPs concurrently
             state.metrics.set_devices_discovered(targets.len());
 
-            for target in &targets {
-                match poll_targeted_device(&state, target, command_timeout).await {
-                    Ok(()) => debug!("Successfully polled {}", target),
-                    Err(e) => warn!("Failed to poll {}: {}", target, e),
-                }
-            }
+            let futures: Vec<_> = targets
+                .iter()
+                .map(|target| {
+                    let state = Arc::clone(&state);
+                    let target = target.clone();
+                    async move {
+                        match poll_targeted_device(&state, &target, command_timeout).await {
+                            Ok(()) => debug!("Successfully polled {}", target),
+                            Err(e) => warn!("Failed to poll {}: {}", target, e),
+                        }
+                    }
+                })
+                .collect();
+            futures::future::join_all(futures).await;
         }
 
         let duration = start.elapsed();
