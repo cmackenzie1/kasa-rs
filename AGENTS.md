@@ -4,7 +4,13 @@ This document provides guidelines for AI coding agents working on the kasa-rs co
 
 ## Project Overview
 
-kasa-rs is a Rust workspace for communicating with TP-Link Kasa smart home devices. It implements the TP-Link Smart Home Protocol (XOR autokey cipher over TCP/UDP port 9999).
+kasa-rs is a Rust workspace for communicating with TP-Link Kasa smart home devices. It supports multiple protocols:
+
+- **Legacy XOR** - Simple XOR autokey cipher over TCP/UDP port 9999 (older devices)
+- **KLAP v1/v2** - HTTP-based protocol with AES encryption on port 80 (newer firmware)
+- **TPAP** - TLS-based protocol with SPAKE2+ authentication on port 4433 (newest devices)
+
+Devices using KLAP or TPAP require TP-Link cloud credentials (`KASA_USERNAME`/`KASA_PASSWORD`).
 
 ### Workspace Structure
 
@@ -14,8 +20,10 @@ kasa-rs/
 ├── crates/
 │   ├── kasa/               # CLI binary (clap-based)
 │   │   └── src/main.rs
-│   └── kasa-core/          # Core async library (tokio-based)
-│       └── src/lib.rs
+│   ├── kasa-core/          # Core async library (tokio-based)
+│   │   └── src/lib.rs
+│   └── kasa-prometheus/    # Prometheus metrics exporter
+│       └── src/main.rs
 ```
 
 ## Build, Test, and Lint Commands

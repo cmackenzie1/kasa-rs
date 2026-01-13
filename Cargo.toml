@@ -10,7 +10,7 @@ repository = "https://github.com/cmackenzie1/kasa-rs"
 [workspace.dependencies]
 kasa-core = { version = "0.4.0", path = "crates/kasa-core" }
 
-clap = { version = "4", default-features = false, features = ["std", "derive", "color", "usage", "help"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "color", "usage", "help", "env"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
