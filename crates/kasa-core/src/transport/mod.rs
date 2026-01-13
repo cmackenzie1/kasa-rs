@@ -10,9 +10,11 @@
 
 pub mod klap;
 pub mod legacy;
+pub mod tpap;
 
 pub use klap::KlapTransport;
 pub use legacy::LegacyTransport;
+pub use tpap::TpapTransport;
 
 use std::time::Duration;
 
@@ -37,6 +39,8 @@ pub enum EncryptionType {
     Klap,
     /// AES protocol on port 443 (Tapo devices, requires authentication).
     Aes,
+    /// TPAP protocol on port 4433 (SPAKE2+ authentication).
+    Tpap,
 }
 
 impl std::fmt::Display for EncryptionType {
@@ -45,6 +49,7 @@ impl std::fmt::Display for EncryptionType {
             EncryptionType::Xor => write!(f, "XOR"),
             EncryptionType::Klap => write!(f, "KLAP"),
             EncryptionType::Aes => write!(f, "AES"),
+            EncryptionType::Tpap => write!(f, "TPAP"),
         }
     }
 }
@@ -133,8 +138,17 @@ impl DeviceConfig {
 /// }
 /// ```
 pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> {
-    // If credentials are provided, try KLAP first
+    // If credentials are provided, try authenticated protocols
     if config.credentials.is_some() {
+        // Try TPAP first (newer firmware on port 4433)
+        match try_tpap(&config).await {
+            Ok(transport) => return Ok(Box::new(transport)),
+            Err(e) => {
+                tracing::debug!("TPAP connection failed: {}, trying KLAP", e);
+            }
+        }
+
+        // Try KLAP (port 80)
         match try_klap(&config).await {
             Ok(transport) => return Ok(Box::new(transport)),
             Err(e) => {
@@ -165,6 +179,13 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         "Could not connect to {} using any protocol",
         config.host
     )))
+}
+
+async fn try_tpap(config: &DeviceConfig) -> Result<TpapTransport, Error> {
+    let port = config.port.unwrap_or(tpap::DEFAULT_PORT);
+    let credentials = config.credentials.clone().unwrap_or_default();
+
+    TpapTransport::connect(&config.host, port, credentials, config.timeout).await
 }
 
 async fn try_klap(config: &DeviceConfig) -> Result<KlapTransport, Error> {
