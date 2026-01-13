@@ -260,3 +260,180 @@ pub trait Transport: Send + Sync {
     /// Returns the device port.
     fn port(&self) -> u16;
 }
+
+/// Extension trait providing typed convenience methods for device communication.
+///
+/// This trait provides high-level methods that handle JSON serialization/deserialization
+/// automatically, making it easier to interact with devices without dealing with raw JSON.
+///
+/// # Example
+///
+/// ```no_run
+/// use kasa_core::transport::{DeviceConfig, connect, TransportExt};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let mut transport = connect(DeviceConfig::new("192.168.1.100")).await?;
+///     
+///     // Get device info with typed response
+///     let sysinfo = transport.get_sysinfo().await?;
+///     println!("Device: {} ({})", sysinfo.alias, sysinfo.model);
+///     
+///     // Get energy reading (if supported)
+///     if let Ok(energy) = transport.get_energy().await {
+///         if let Some(power) = energy.power_w() {
+///             println!("Power: {:.1}W", power);
+///         }
+///     }
+///     
+///     // Control the relay
+///     transport.set_relay_state(true).await?;
+///     
+///     Ok(())
+/// }
+/// ```
+#[async_trait]
+pub trait TransportExt: Transport {
+    /// Gets device system information.
+    ///
+    /// Returns detailed information about the device including model, firmware version,
+    /// current relay state, and for power strips, information about each child plug.
+    async fn get_sysinfo(&mut self) -> Result<crate::response::SysInfo, Error>;
+
+    /// Gets real-time energy meter readings.
+    ///
+    /// Returns voltage, current, power, and total energy consumption.
+    /// Only available on devices with energy monitoring (e.g., HS110, KP115, HS300).
+    ///
+    /// The returned [`EnergyReading`](crate::response::EnergyReading) normalizes values
+    /// to standard units (volts, amps, watts) regardless of device-specific formats.
+    async fn get_energy(&mut self) -> Result<crate::response::EnergyReading, Error>;
+
+    /// Gets cloud connection information.
+    ///
+    /// Returns whether the device is connected to TP-Link cloud services.
+    async fn get_cloud_info(&mut self) -> Result<crate::response::CloudInfo, Error>;
+
+    /// Sets the relay state (on/off).
+    ///
+    /// # Arguments
+    ///
+    /// * `on` - `true` to turn on, `false` to turn off
+    async fn set_relay_state(&mut self, on: bool) -> Result<(), Error>;
+
+    /// Sets the LED indicator state.
+    ///
+    /// # Arguments
+    ///
+    /// * `off` - `true` to turn LED off, `false` to turn LED on
+    async fn set_led_off(&mut self, off: bool) -> Result<(), Error>;
+
+    /// Gets energy meter readings for a specific child plug on a power strip.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from [`SysInfo::children`](crate::response::SysInfo::children))
+    async fn get_energy_for_child(
+        &mut self,
+        child_id: &str,
+    ) -> Result<crate::response::EnergyReading, Error>;
+
+    /// Sets the relay state for a specific child plug on a power strip.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_id` - The child plug ID (from [`SysInfo::children`](crate::response::SysInfo::children))
+    /// * `on` - `true` to turn on, `false` to turn off
+    async fn set_relay_state_for_child(&mut self, child_id: &str, on: bool) -> Result<(), Error>;
+
+    /// Reboots the device.
+    ///
+    /// The device will restart after a 1-second delay.
+    async fn reboot(&mut self) -> Result<(), Error>;
+}
+
+#[async_trait]
+impl<T: Transport + ?Sized + Send> TransportExt for T {
+    async fn get_sysinfo(&mut self) -> Result<crate::response::SysInfo, Error> {
+        let response = self.send(crate::commands::INFO).await?;
+        let parsed: crate::response::SysInfoResponse =
+            serde_json::from_str(&response).map_err(|e| Error::ParseError(e.to_string()))?;
+        Ok(parsed.system.get_sysinfo)
+    }
+
+    async fn get_energy(&mut self) -> Result<crate::response::EnergyReading, Error> {
+        let response = self.send(crate::commands::ENERGY).await?;
+        let parsed: crate::response::EmeterResponse =
+            serde_json::from_str(&response).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        if parsed.emeter.get_realtime.err_code != 0 {
+            return Err(Error::DeviceError(format!(
+                "Energy monitoring not supported (err_code: {})",
+                parsed.emeter.get_realtime.err_code
+            )));
+        }
+
+        Ok(parsed.emeter.get_realtime)
+    }
+
+    async fn get_cloud_info(&mut self) -> Result<crate::response::CloudInfo, Error> {
+        let response = self.send(crate::commands::CLOUDINFO).await?;
+        let parsed: crate::response::CloudInfoResponse =
+            serde_json::from_str(&response).map_err(|e| Error::ParseError(e.to_string()))?;
+        Ok(parsed.cn_cloud.get_info)
+    }
+
+    async fn set_relay_state(&mut self, on: bool) -> Result<(), Error> {
+        let command = if on {
+            crate::commands::RELAY_ON
+        } else {
+            crate::commands::RELAY_OFF
+        };
+        self.send(command).await?;
+        Ok(())
+    }
+
+    async fn set_led_off(&mut self, off: bool) -> Result<(), Error> {
+        let command = if off {
+            crate::commands::LED_OFF
+        } else {
+            crate::commands::LED_ON
+        };
+        self.send(command).await?;
+        Ok(())
+    }
+
+    async fn get_energy_for_child(
+        &mut self,
+        child_id: &str,
+    ) -> Result<crate::response::EnergyReading, Error> {
+        let command = crate::commands::energy_for_child(child_id);
+        let response = self.send(&command).await?;
+        let parsed: crate::response::EmeterResponse =
+            serde_json::from_str(&response).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        if parsed.emeter.get_realtime.err_code != 0 {
+            return Err(Error::DeviceError(format!(
+                "Energy monitoring not supported for child {} (err_code: {})",
+                child_id, parsed.emeter.get_realtime.err_code
+            )));
+        }
+
+        Ok(parsed.emeter.get_realtime)
+    }
+
+    async fn set_relay_state_for_child(&mut self, child_id: &str, on: bool) -> Result<(), Error> {
+        let command = if on {
+            crate::commands::relay_on_for_child(child_id)
+        } else {
+            crate::commands::relay_off_for_child(child_id)
+        };
+        self.send(&command).await?;
+        Ok(())
+    }
+
+    async fn reboot(&mut self) -> Result<(), Error> {
+        self.send(crate::commands::REBOOT).await?;
+        Ok(())
+    }
+}

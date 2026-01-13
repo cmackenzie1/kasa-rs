@@ -77,7 +77,7 @@ pub mod transport;
 pub use credentials::Credentials;
 pub use discovery::DiscoveredDevice;
 pub use error::Error;
-pub use transport::{DeviceConfig, EncryptionType, Transport, connect};
+pub use transport::{DeviceConfig, EncryptionType, Transport, TransportExt, connect};
 
 // Re-export crypto functions for backward compatibility
 pub use crypto::xor::{decrypt, encrypt};
