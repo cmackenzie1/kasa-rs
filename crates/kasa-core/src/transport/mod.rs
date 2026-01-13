@@ -392,6 +392,23 @@ pub trait TransportExt: Transport {
     /// * `on` - `true` to turn on, `false` to turn off
     async fn set_relay_state_for_child(&mut self, child_id: &str, on: bool) -> Result<(), Error>;
 
+    /// Gets energy meter readings for all child plugs in a single request.
+    ///
+    /// This is significantly more efficient than calling [`get_energy_for_child`](Self::get_energy_for_child)
+    /// multiple times, as it batches all requests into a single network round trip.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_ids` - Slice of child plug IDs (from [`SysInfo::children`](crate::response::SysInfo::children))
+    ///
+    /// # Returns
+    ///
+    /// A vector of energy readings in the same order as the provided child IDs.
+    async fn get_energy_for_children(
+        &mut self,
+        child_ids: &[&str],
+    ) -> Result<Vec<crate::response::EnergyReading>, Error>;
+
     /// Reboots the device.
     ///
     /// The device will restart after a 1-second delay.
@@ -476,6 +493,37 @@ impl<T: Transport + ?Sized + Send> TransportExt for T {
         };
         self.send(&command).await?;
         Ok(())
+    }
+
+    async fn get_energy_for_children(
+        &mut self,
+        child_ids: &[&str],
+    ) -> Result<Vec<crate::response::EnergyReading>, Error> {
+        if child_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let command = crate::commands::energy_for_children(child_ids);
+        let response = self.send(&command).await?;
+
+        // Try parsing as batch response first (array of readings)
+        if let Ok(parsed) = serde_json::from_str::<crate::response::BatchEmeterResponse>(&response)
+        {
+            return Ok(parsed.emeter.get_realtime);
+        }
+
+        // Fall back to single response (some devices may not support batching)
+        let parsed: crate::response::EmeterResponse =
+            serde_json::from_str(&response).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        if parsed.emeter.get_realtime.err_code != 0 {
+            return Err(Error::DeviceError(format!(
+                "Energy monitoring failed (err_code: {})",
+                parsed.emeter.get_realtime.err_code
+            )));
+        }
+
+        Ok(vec![parsed.emeter.get_realtime])
     }
 
     async fn reboot(&mut self) -> Result<(), Error> {
