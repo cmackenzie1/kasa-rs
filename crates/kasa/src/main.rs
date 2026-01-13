@@ -2,7 +2,7 @@ use std::{io::IsTerminal, time::Duration};
 
 use clap::{Parser, Subcommand};
 use kasa_core::{
-    Credentials, DEFAULT_PORT, broadcast, commands, discover, send_command,
+    Credentials, DEFAULT_PORT, broadcast, commands, discovery, send_command,
     transport::{DeviceConfig, connect},
 };
 use tracing::{debug, error};
@@ -386,8 +386,9 @@ async fn main() {
             println!("kasa-core {}", kasa_core::VERSION);
         }
 
-        Command::Discover { timeout } => match discover(timeout).await {
+        Command::Discover { timeout } => match discovery::discover_all(timeout).await {
             Ok(devices) => {
+                debug!("Discovered {} devices", devices.len());
                 let json = serde_json::to_value(&devices).unwrap_or_default();
                 println!("{}", json);
             }
