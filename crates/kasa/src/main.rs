@@ -1,11 +1,8 @@
-use std::{io::IsTerminal, sync::Arc, time::Duration};
+use std::{io::IsTerminal, time::Duration};
 
 use clap::{Parser, Subcommand};
 use kasa_core::{
-    Credentials, DEFAULT_PORT, broadcast, commands, discovery,
-    error::Error as KasaError,
-    response::EnergyReading,
-    send_command,
+    Credentials, DEFAULT_PORT, broadcast, commands, discovery, send_command,
     transport::{DeviceConfig, Transport, TransportExt, connect},
 };
 use tracing::{debug, error};
@@ -461,9 +458,7 @@ async fn main() {
 
                         // Handle energy command specially for power strips
                         if matches!(command, DeviceCommand::Energy) && plug.is_none() {
-                            // Convert Box to Arc for concurrent access
-                            let transport: Arc<dyn Transport> = Arc::from(transport);
-                            match handle_energy_command(transport).await {
+                            match handle_energy_command(transport.as_ref()).await {
                                 Ok(()) => {}
                                 Err(e) => {
                                     error!("Energy command failed: {}", e);
@@ -920,9 +915,12 @@ fn print_wifi_join_success(ssid: &str) {
 /// Handle the energy command, detecting power strips and returning all plug readings.
 ///
 /// For single devices, returns the standard energy response.
-/// For power strips (devices with children), returns energy readings for all plugs
-/// concurrently for better performance.
-async fn handle_energy_command(transport: Arc<dyn Transport>) -> Result<(), String> {
+/// For power strips (devices with children), returns energy readings for all plugs.
+///
+/// Note: Requests are made sequentially because TP-Link devices cannot handle
+/// concurrent requests reliably - they return errors when multiple requests
+/// arrive simultaneously.
+async fn handle_energy_command(transport: &dyn Transport) -> Result<(), String> {
     // First get sysinfo to check if this is a power strip
     let sysinfo = transport
         .get_sysinfo()
@@ -930,29 +928,14 @@ async fn handle_energy_command(transport: Arc<dyn Transport>) -> Result<(), Stri
         .map_err(|e| format!("Failed to get device info: {}", e))?;
 
     if sysinfo.is_power_strip() {
-        // Power strip - get energy for all plugs concurrently
+        // Power strip - get energy for all plugs sequentially
+        // (device cannot handle concurrent requests)
         debug!(
-            "Device is a power strip with {} plugs, fetching all energy readings concurrently",
+            "Device is a power strip with {} plugs, fetching energy readings",
             sysinfo.children.len()
         );
 
-        // Create futures for all child energy requests
-        let futures: Vec<_> = sysinfo
-            .children
-            .iter()
-            .map(|child| {
-                let transport = Arc::clone(&transport);
-                let child_id = child.id.clone();
-                async move { transport.get_energy_for_child(&child_id).await }
-            })
-            .collect();
-
-        // Execute all requests concurrently
-        let results: Vec<Result<EnergyReading, KasaError>> =
-            futures::future::join_all(futures).await;
-
-        // Build response JSON matching the format users expect
-        // Include child info (alias, slot) alongside energy data
+        // Build response JSON
         let mut output = serde_json::json!({
             "device": {
                 "alias": sysinfo.alias,
@@ -963,8 +946,8 @@ async fn handle_energy_command(transport: Arc<dyn Transport>) -> Result<(), Stri
         });
 
         let plugs = output["plugs"].as_array_mut().unwrap();
-        for (slot, (child, result)) in sysinfo.children.iter().zip(results.iter()).enumerate() {
-            let energy = match result {
+        for (slot, child) in sysinfo.children.iter().enumerate() {
+            let energy = match transport.get_energy_for_child(&child.id).await {
                 Ok(reading) => serde_json::json!({
                     "voltage_v": reading.voltage_v(),
                     "current_a": reading.current_a(),
