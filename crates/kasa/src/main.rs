@@ -3,7 +3,7 @@ use std::{io::IsTerminal, time::Duration};
 use clap::{Parser, Subcommand};
 use kasa_core::{
     Credentials, DEFAULT_PORT, broadcast, commands, discovery, send_command,
-    transport::{DeviceConfig, connect},
+    transport::{DeviceConfig, Transport, connect},
 };
 use tracing::{debug, error};
 
@@ -416,23 +416,16 @@ async fn main() {
                 }
             };
 
-            // Build the command JSON
-            let command_json = build_command_json(
-                &command,
-                &plug,
-                &target,
-                port,
-                timeout,
-                legacy,
-                &credentials,
-            )
-            .await;
-
             // Send command using appropriate transport
             if legacy {
-                // Force legacy protocol
+                // Force legacy protocol - use send_command directly
                 let port = port.unwrap_or(DEFAULT_PORT);
                 debug!("Using legacy protocol on port {}", port);
+
+                // Build command JSON (plug resolution uses legacy transport too)
+                let command_json =
+                    build_command_json_legacy(&command, &plug, &target, port, timeout).await;
+
                 match send_command(&target, port, timeout, &command_json).await {
                     Ok(response) => print_json_response(&response),
                     Err(e) => {
@@ -445,7 +438,7 @@ async fn main() {
                     }
                 }
             } else {
-                // Auto-detect protocol
+                // Auto-detect protocol - create transport first
                 let mut config = DeviceConfig::new(&target).with_timeout(timeout);
                 if let Some(p) = port {
                     config = config.with_port(p);
@@ -462,6 +455,22 @@ async fn main() {
                             transport.encryption_type(),
                             transport.port()
                         );
+
+                        // Build command JSON using the established transport
+                        let command_json = match build_command_json_with_transport(
+                            &command,
+                            &plug,
+                            &mut transport,
+                        )
+                        .await
+                        {
+                            Ok(json) => json,
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+
                         match transport.send(&command_json).await {
                             Ok(response) => print_json_response(&response),
                             Err(e) => {
@@ -671,101 +680,56 @@ async fn main() {
     }
 }
 
-/// Build the command JSON, resolving plug IDs if needed.
-async fn build_command_json(
+/// Build the command JSON using legacy transport, resolving plug IDs if needed.
+async fn build_command_json_legacy(
     command: &DeviceCommand,
     plug: &Option<String>,
     target: &str,
-    port: Option<u16>,
+    port: u16,
     timeout: Duration,
-    legacy: bool,
-    _credentials: &Option<Credentials>,
 ) -> String {
     // Resolve plug ID if specified
     let child_id = match plug {
-        Some(plug_arg) => {
-            // Check if it's a slot number (0-9) or a full ID
-            if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
-                // It's a slot number, need to fetch sysinfo to get the full ID
-                let slot: usize = plug_arg.parse().unwrap_or_else(|_| {
-                    eprintln!("Error: Invalid plug number: {}", plug_arg);
-                    std::process::exit(1);
-                });
-
-                debug!("Resolving plug slot {} to child ID", slot);
-                let port = port.unwrap_or(if legacy { DEFAULT_PORT } else { 80 });
-                match send_command(target, port, timeout, commands::INFO).await {
-                    Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
-                        Ok(json) => {
-                            let children = json
-                                .get("system")
-                                .and_then(|s| s.get("get_sysinfo"))
-                                .and_then(|s| s.get("children"))
-                                .and_then(|c| c.as_array());
-
-                            match children {
-                                Some(children) => {
-                                    if slot >= children.len() {
-                                        eprintln!(
-                                            "Error: Plug {} not found. Device has {} plugs (0-{})",
-                                            slot,
-                                            children.len(),
-                                            children.len() - 1
-                                        );
-                                        std::process::exit(1);
-                                    }
-                                    children[slot]
-                                        .get("id")
-                                        .and_then(|id| id.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| {
-                                            eprintln!("Error: Plug {} has no ID", slot);
-                                            std::process::exit(1);
-                                        })
-                                }
-                                None => {
-                                    eprintln!(
-                                        "Error: Device does not have child plugs. \
-                                            The --plug option is only for power strips."
-                                    );
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error: Failed to parse sysinfo: {}", e);
-                            std::process::exit(1);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Error: Failed to get sysinfo: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // It's a full child ID
-                plug_arg.clone()
-            }
-        }
+        Some(plug_arg) => resolve_child_id_legacy(plug_arg, target, port, timeout).await,
         None => String::new(),
     };
 
+    build_final_command_json(command, &child_id)
+}
+
+/// Build the command JSON using an existing transport, resolving plug IDs if needed.
+async fn build_command_json_with_transport(
+    command: &DeviceCommand,
+    plug: &Option<String>,
+    transport: &mut Box<dyn Transport>,
+) -> Result<String, String> {
+    // Resolve plug ID if specified
+    let child_id = match plug {
+        Some(plug_arg) => resolve_child_id_with_transport(plug_arg, transport).await?,
+        None => String::new(),
+    };
+
+    Ok(build_final_command_json(command, &child_id))
+}
+
+/// Build the final command JSON with optional child context.
+fn build_final_command_json(command: &DeviceCommand, child_id: &str) -> String {
     if !child_id.is_empty() {
         // Wrap command with child context
         match command {
-            DeviceCommand::Energy => commands::energy_for_child(&child_id),
-            DeviceCommand::On => commands::relay_on_for_child(&child_id),
-            DeviceCommand::Off => commands::relay_off_for_child(&child_id),
+            DeviceCommand::Energy => commands::energy_for_child(child_id),
+            DeviceCommand::On => commands::relay_on_for_child(child_id),
+            DeviceCommand::Off => commands::relay_off_for_child(child_id),
             _ => {
                 // For other commands, check if they can be wrapped
                 match command.to_command_json() {
                     CommandJson::Static(s) => {
                         let inner = s.trim_start_matches('{').trim_end_matches('}');
-                        commands::with_child_context(&child_id, inner)
+                        commands::with_child_context(child_id, inner)
                     }
                     CommandJson::Dynamic(s) => {
                         let inner = s.trim_start_matches('{').trim_end_matches('}');
-                        commands::with_child_context(&child_id, inner)
+                        commands::with_child_context(child_id, inner)
                     }
                     CommandJson::Special(SpecialCommand::CloudBind { .. }) => {
                         eprintln!("Error: cloud-bind command cannot be used with --plug");
@@ -793,6 +757,107 @@ async fn build_command_json(
                 };
                 commands::cloud_bind(&username, &pass)
             }
+        }
+    }
+}
+
+/// Resolve a plug slot number or ID using legacy transport.
+async fn resolve_child_id_legacy(
+    plug_arg: &str,
+    target: &str,
+    port: u16,
+    timeout: Duration,
+) -> String {
+    // Check if it's a slot number (0-9) or a full ID
+    if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
+        let slot: usize = plug_arg.parse().unwrap_or_else(|_| {
+            eprintln!("Error: Invalid plug number: {}", plug_arg);
+            std::process::exit(1);
+        });
+
+        debug!(
+            "Resolving plug slot {} to child ID via legacy transport",
+            slot
+        );
+        match send_command(target, port, timeout, commands::INFO).await {
+            Ok(response) => extract_child_id_from_response(&response, slot),
+            Err(e) => {
+                eprintln!("Error: Failed to get sysinfo: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // It's a full child ID
+        plug_arg.to_string()
+    }
+}
+
+/// Resolve a plug slot number or ID using an existing transport.
+async fn resolve_child_id_with_transport(
+    plug_arg: &str,
+    transport: &mut Box<dyn Transport>,
+) -> Result<String, String> {
+    // Check if it's a slot number (0-9) or a full ID
+    if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
+        let slot: usize = plug_arg
+            .parse()
+            .map_err(|_| format!("Invalid plug number: {}", plug_arg))?;
+
+        debug!("Resolving plug slot {} to child ID via transport", slot);
+        let response = transport
+            .send(commands::INFO)
+            .await
+            .map_err(|e| format!("Failed to get sysinfo: {}", e))?;
+
+        Ok(extract_child_id_from_response(&response, slot))
+    } else {
+        // It's a full child ID
+        Ok(plug_arg.to_string())
+    }
+}
+
+/// Extract child ID from sysinfo response.
+fn extract_child_id_from_response(response: &str, slot: usize) -> String {
+    match serde_json::from_str::<serde_json::Value>(response) {
+        Ok(json) => {
+            let children = json
+                .get("system")
+                .and_then(|s| s.get("get_sysinfo"))
+                .and_then(|s| s.get("children"))
+                .and_then(|c| c.as_array());
+
+            match children {
+                Some(children) => {
+                    if slot >= children.len() {
+                        eprintln!(
+                            "Error: Plug {} not found. Device has {} plugs (0-{})",
+                            slot,
+                            children.len(),
+                            children.len() - 1
+                        );
+                        std::process::exit(1);
+                    }
+                    children[slot]
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: Plug {} has no ID", slot);
+                            std::process::exit(1);
+                        })
+                }
+                None => {
+                    eprintln!(
+                        "Error: Device does not have child plugs. \
+                            The --plug option is only for power strips."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to parse sysinfo: {}", e);
+            std::process::exit(1);
         }
     }
 }
