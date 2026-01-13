@@ -11,19 +11,39 @@ repository.workspace = true
 ignored = ["md-5"]  # Used as md5:: due to crate naming conventions
 
 [dependencies]
-aes = "0.8.4"
 async-trait = "0.1.89"
-cbc = "0.1.2"
 crc32fast = "1.4"
 futures.workspace = true
 hex = "0.4.3"
-md-5 = "0.10.6"
 rand = "0.9.2"
-rsa = { version = "0.9", features = ["pem"] }
 serde.workspace = true
 serde_json.workspace = true
-sha1 = "0.10.6"
-sha2 = "0.10.9"
 thiserror = "2.0.17"
 tokio.workspace = true
 tracing.workspace = true
+
+# Start RustCrypto
+# https://github.com/RustCrypto
+aes = "0.8.4"
+cbc = "0.1.2"
+rsa = { version = "0.9", features = ["pem"] }
+md-5 = "0.10.6"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+# TPAP/SPAKE2+ support
+p256 = { version = "0.13", features = ["arithmetic", "ecdh"] }
+pbkdf2 = "0.12"
+hkdf = "0.12"
+hmac = "0.12"
+cmac = "0.7"
+ccm = "0.5"
+chacha20poly1305 = "0.10"
+hex-literal = "0.4"
+# End RustCrypto
+
+# TLS support for TPAP
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pki-types = "1.0"
+webpki-roots = "0.26"
+base64 = "0.22"
