@@ -513,10 +513,19 @@ async fn main() {
             timeout,
             command,
         } => {
+            // Get credentials if provided (for KLAP/TPAP devices)
+            let credentials = match get_credentials(cli.username.clone(), cli.password_stdin) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
             let command_json = command.to_json();
             debug!("Broadcasting command: {}", command_json);
 
-            match broadcast(discovery_timeout, timeout, command_json).await {
+            match broadcast(discovery_timeout, timeout, command_json, credentials).await {
                 Ok(results) => {
                     let json = serde_json::to_value(&results).unwrap_or_default();
                     println!("{}", json);
