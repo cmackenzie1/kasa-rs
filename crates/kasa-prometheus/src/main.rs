@@ -421,6 +421,7 @@ async fn poll_targeted_device(
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
             == 1,
+        encryption_type: kasa_core::EncryptionType::Xor,
     };
 
     // Check if this is a power strip with children

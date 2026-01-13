@@ -1,63 +1,91 @@
 //! Core library for communicating with TP-Link Kasa smart home devices.
 //!
-//! This crate implements the TP-Link Smart Home Protocol, which uses an
-//! XOR autokey cipher for encryption. It provides async functions for
-//! encrypting/decrypting messages and sending commands to Kasa devices.
+//! This crate implements both the legacy TP-Link Smart Home Protocol (XOR cipher)
+//! and the newer KLAP protocol (AES encryption with authentication).
 //!
-//! # Overview
+//! # Protocols
 //!
-//! TP-Link Kasa devices communicate over TCP port 9999 using a simple
-//! JSON-based protocol. Messages are encrypted using an XOR autokey cipher
-//! with a starting key of 171. Each message is prefixed with a 4-byte
-//! big-endian length header.
+//! ## Legacy Protocol (XOR)
 //!
-//! # Example
+//! Older devices use a simple XOR autokey cipher on TCP port 9999.
+//! No authentication is required. Use [`send_command`] for quick access.
+//!
+//! ## KLAP Protocol
+//!
+//! Newer firmware versions use the KLAP (Kasa Local Authentication Protocol)
+//! over HTTP port 80. This requires TP-Link cloud credentials. Use the
+//! [`transport`] module for KLAP support.
+//!
+//! # Quick Start
+//!
+//! For legacy devices (no credentials needed):
 //!
 //! ```no_run
-//! use std::time::Duration;
 //! use kasa_core::{commands, send_command, DEFAULT_PORT, DEFAULT_TIMEOUT};
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
-//!     // Get device system information
 //!     let response = send_command(
 //!         "192.168.1.100",
 //!         DEFAULT_PORT,
 //!         DEFAULT_TIMEOUT,
 //!         commands::INFO,
 //!     ).await?;
-//!
 //!     println!("{}", response);
 //!     Ok(())
 //! }
 //! ```
 //!
-//! # Protocol Details
+//! For newer devices with KLAP (credentials required):
 //!
-//! The TP-Link Smart Home Protocol works as follows:
+//! ```no_run
+//! use kasa_core::{Credentials, transport::{DeviceConfig, connect, Transport}};
 //!
-//! 1. Commands are JSON strings (e.g., `{"system":{"get_sysinfo":{}}}`)
-//! 2. The JSON is encrypted using XOR autokey cipher with initial key 171
-//! 3. A 4-byte big-endian length prefix is prepended
-//! 4. The message is sent over TCP to port 9999
-//! 5. The response follows the same format and is decrypted the same way
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = DeviceConfig::new("192.168.1.100")
+//!         .with_credentials(Credentials::new("user@example.com", "password"));
+//!     
+//!     let mut transport = connect(config).await?;
+//!     let response = transport.send(r#"{"system":{"get_sysinfo":{}}}"#).await?;
+//!     println!("{}", response);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Auto-Detection
+//!
+//! The [`transport::connect`] function automatically detects which protocol
+//! a device uses and connects appropriately.
 
 use std::{net::IpAddr, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
-    time::timeout,
-};
+use tokio::{net::UdpSocket, time::timeout};
 use tracing::debug;
+
+// Public modules
+pub mod commands;
+pub mod credentials;
+pub mod crypto;
+pub mod error;
+pub mod transport;
+
+// Re-exports for convenience
+pub use credentials::Credentials;
+pub use error::Error;
+pub use transport::{DeviceConfig, EncryptionType, Transport, connect};
+
+// Re-export crypto functions for backward compatibility
+pub use crypto::xor::{decrypt, encrypt};
 
 /// The version of the kasa-core library.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default TCP port for TP-Link Kasa smart devices.
+/// Default TCP port for legacy TP-Link Kasa smart devices.
 ///
-/// All Kasa devices listen on port 9999 for the Smart Home Protocol.
+/// Legacy devices listen on port 9999 for the XOR-encrypted Smart Home Protocol.
+/// Newer devices use port 80 (HTTP) for the KLAP protocol.
 pub const DEFAULT_PORT: u16 = 9999;
 
 /// Default connection timeout.
@@ -73,252 +101,12 @@ pub const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Broadcast address for UDP discovery.
 const BROADCAST_ADDR: &str = "255.255.255.255:9999";
 
-/// Predefined JSON command strings for common TP-Link Kasa device operations.
-///
-/// These constants can be passed directly to [`send_command`] to perform
-/// common operations without constructing JSON manually.
-///
-/// # Example
-///
-/// ```no_run
-/// use kasa_core::{commands, send_command, DEFAULT_PORT, DEFAULT_TIMEOUT};
-///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
-///     // Turn on a smart plug
-///     send_command("192.168.1.100", DEFAULT_PORT, DEFAULT_TIMEOUT, commands::RELAY_ON).await?;
-///     Ok(())
-/// }
-/// ```
-pub mod commands {
-    /// Get anti-theft rules configuration.
-    pub const ANTITHEFT: &str = r#"{"anti_theft":{"get_rules":{}}}"#;
-
-    /// Get cloud connection information.
-    pub const CLOUDINFO: &str = r#"{"cnCloud":{"get_info":{}}}"#;
-
-    /// Unbind device from TP-Link cloud account.
-    ///
-    /// This removes the device from cloud control but it continues to work locally.
-    pub const CLOUD_UNBIND: &str = r#"{"cnCloud":{"unbind":{}}}"#;
-
-    /// Bind device to TP-Link cloud account.
-    ///
-    /// Requires username and password - use [`cloud_bind_command`] to generate
-    /// the command with credentials.
-    ///
-    /// [`cloud_bind_command`]: fn.cloud_bind_command.html
-    pub const CLOUD_BIND_TEMPLATE: &str =
-        r#"{"cnCloud":{"bind":{"username":"{{USERNAME}}","password":"{{PASSWORD}}"}}}"#;
-
-    /// Get countdown timer rules.
-    pub const COUNTDOWN: &str = r#"{"count_down":{"get_rules":{}}}"#;
-
-    /// Erase all energy meter statistics.
-    ///
-    /// **Warning:** This permanently deletes energy usage history.
-    pub const ENERGY_RESET: &str = r#"{"emeter":{"erase_emeter_stat":{}}}"#;
-
-    /// Get real-time energy meter readings.
-    ///
-    /// Returns current voltage, current, power, and total energy consumption.
-    /// Only available on devices with energy monitoring (e.g., HS110, KP115).
-    pub const ENERGY: &str = r#"{"emeter":{"get_realtime":{}}}"#;
-
-    /// Get system information.
-    ///
-    /// Returns device model, alias, MAC address, firmware version, relay state, and more.
-    pub const INFO: &str = r#"{"system":{"get_sysinfo":{}}}"#;
-
-    /// Turn off the LED indicator light.
-    pub const LED_OFF: &str = r#"{"system":{"set_led_off":{"off":1}}}"#;
-
-    /// Turn on the LED indicator light.
-    pub const LED_ON: &str = r#"{"system":{"set_led_off":{"off":0}}}"#;
-
-    /// Turn off the relay (power off the connected device).
-    pub const RELAY_OFF: &str = r#"{"system":{"set_relay_state":{"state":0}}}"#;
-
-    /// Turn on the relay (power on the connected device).
-    pub const RELAY_ON: &str = r#"{"system":{"set_relay_state":{"state":1}}}"#;
-
-    /// Reboot the device with a 1-second delay.
-    pub const REBOOT: &str = r#"{"system":{"reboot":{"delay":1}}}"#;
-
-    /// Factory reset the device with a 1-second delay.
-    ///
-    /// **Warning:** This will erase all settings and require re-setup.
-    pub const RESET: &str = r#"{"system":{"reset":{"delay":1}}}"#;
-
-    /// Erase runtime statistics.
-    pub const RUNTIME_RESET: &str = r#"{"schedule":{"erase_runtime_stat":{}}}"#;
-
-    /// Get schedule rules.
-    pub const SCHEDULE: &str = r#"{"schedule":{"get_rules":{}}}"#;
-
-    /// Get the device's current time.
-    pub const TIME: &str = r#"{"time":{"get_time":{}}}"#;
-
-    /// Scan for available wireless networks.
-    pub const WLANSCAN: &str = r#"{"netif":{"get_scaninfo":{"refresh":0}}}"#;
-
-    /// Scan for available wireless networks (alternative endpoint for newer devices).
-    ///
-    /// Some newer devices use the `smartlife.iot.common.softaponboarding` module
-    /// instead of `netif`. Try [`WLANSCAN`] first, then fall back to this.
-    pub const WLANSCAN_SOFTAP: &str =
-        r#"{"smartlife.iot.common.softaponboarding":{"get_scaninfo":{"refresh":0}}}"#;
-
-    /// Generate a cloud bind command with the given credentials.
-    ///
-    /// # Arguments
-    ///
-    /// * `username` - TP-Link account email address
-    /// * `password` - TP-Link account password
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use kasa_core::commands;
-    ///
-    /// let cmd = commands::cloud_bind("user@example.com", "secret123");
-    /// assert!(cmd.contains("user@example.com"));
-    /// ```
-    ///
-    /// # Security Note
-    ///
-    /// The password is sent in plaintext within the JSON command, though it is
-    /// encrypted using the TP-Link protocol before transmission over the network.
-    pub fn cloud_bind(username: &str, password: &str) -> String {
-        format!(
-            r#"{{"cnCloud":{{"bind":{{"username":"{}","password":"{}"}}}}}}"#,
-            username, password
-        )
-    }
-
-    /// Generate a command to connect the device to a WiFi network.
-    ///
-    /// This command is used during device provisioning when the device is in AP mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssid` - Network name (SSID) to connect to
-    /// * `password` - Network password
-    /// * `key_type` - Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use kasa_core::commands;
-    ///
-    /// let cmd = commands::wifi_join("MyNetwork", "secret123", 3);
-    /// assert!(cmd.contains("MyNetwork"));
-    /// assert!(cmd.contains("key_type"));
-    /// ```
-    ///
-    /// # Security Note
-    ///
-    /// The password is sent in plaintext within the JSON command, though it is
-    /// encrypted using the TP-Link protocol before transmission over the network.
-    pub fn wifi_join(ssid: &str, password: &str, key_type: u8) -> String {
-        format!(
-            r#"{{"netif":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
-            ssid, password, key_type
-        )
-    }
-
-    /// Generate a command to connect the device to a WiFi network (alternative endpoint).
-    ///
-    /// Some newer devices use the `smartlife.iot.common.softaponboarding` module
-    /// instead of `netif`. Try [`wifi_join`] first, then fall back to this.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssid` - Network name (SSID) to connect to
-    /// * `password` - Network password
-    /// * `key_type` - Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2
-    pub fn wifi_join_softap(ssid: &str, password: &str, key_type: u8) -> String {
-        format!(
-            r#"{{"smartlife.iot.common.softaponboarding":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
-            ssid, password, key_type
-        )
-    }
-
-    /// Wrap a command with context for a specific child plug.
-    ///
-    /// Power strips like the HS300 have multiple outlets (children). To send
-    /// commands to a specific outlet, you need to wrap the command with a
-    /// context containing the child ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `child_id` - The child plug ID (from sysinfo children array)
-    /// * `command` - The JSON command to wrap (must be a valid JSON object without outer braces)
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use kasa_core::commands;
-    ///
-    /// // Get energy for a specific plug
-    /// let cmd = commands::with_child_context(
-    ///     "80064BBD5F529B1CE4DA888AF48CF58C24F0263501",
-    ///     r#""emeter":{"get_realtime":{}}"#
-    /// );
-    /// assert!(cmd.contains("context"));
-    /// assert!(cmd.contains("child_ids"));
-    /// ```
-    pub fn with_child_context(child_id: &str, command_inner: &str) -> String {
-        format!(
-            r#"{{"context":{{"child_ids":["{}"]}},{}}}"#,
-            child_id, command_inner
-        )
-    }
-
-    /// Generate an energy reading command for a specific child plug.
-    ///
-    /// # Arguments
-    ///
-    /// * `child_id` - The child plug ID (from sysinfo children array)
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use kasa_core::commands;
-    ///
-    /// let cmd = commands::energy_for_child("80064BBD5F529B1CE4DA888AF48CF58C24F0263501");
-    /// assert!(cmd.contains("emeter"));
-    /// assert!(cmd.contains("get_realtime"));
-    /// ```
-    pub fn energy_for_child(child_id: &str) -> String {
-        with_child_context(child_id, r#""emeter":{"get_realtime":{}}"#)
-    }
-
-    /// Generate a relay on command for a specific child plug.
-    ///
-    /// # Arguments
-    ///
-    /// * `child_id` - The child plug ID (from sysinfo children array)
-    pub fn relay_on_for_child(child_id: &str) -> String {
-        with_child_context(child_id, r#""system":{"set_relay_state":{"state":1}}"#)
-    }
-
-    /// Generate a relay off command for a specific child plug.
-    ///
-    /// # Arguments
-    ///
-    /// * `child_id` - The child plug ID (from sysinfo children array)
-    pub fn relay_off_for_child(child_id: &str) -> String {
-        with_child_context(child_id, r#""system":{"set_relay_state":{"state":0}}"#)
-    }
-}
-
 /// Information about a discovered Kasa device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
     /// IP address of the device.
     pub ip: IpAddr,
-    /// TCP port (typically 9999).
+    /// TCP port (typically 9999 for legacy, 80 for KLAP).
     pub port: u16,
     /// Device alias/name set by the user.
     pub alias: String,
@@ -342,6 +130,9 @@ pub struct DiscoveredDevice {
     pub on_time: u64,
     /// Whether a firmware update is in progress.
     pub updating: bool,
+    /// Detected encryption type (if known).
+    #[serde(default)]
+    pub encryption_type: EncryptionType,
 }
 
 /// Security type for WiFi networks.
@@ -465,117 +256,17 @@ struct SysInfo {
     updating: u8,
 }
 
-/// Encrypts a plaintext string using the TP-Link Smart Home Protocol.
+/// Sends a command to a TP-Link Kasa device using the legacy XOR protocol.
 ///
-/// The encryption uses an XOR autokey cipher with a starting key of 171.
-/// The result includes a 4-byte big-endian length prefix followed by the
-/// encrypted payload.
-///
-/// # Arguments
-///
-/// * `plaintext` - The JSON command string to encrypt
-///
-/// # Returns
-///
-/// A byte vector containing the length prefix and encrypted payload,
-/// ready to be sent over TCP.
-///
-/// # Example
-///
-/// ```
-/// use kasa_core::encrypt;
-///
-/// let command = r#"{"system":{"get_sysinfo":{}}}"#;
-/// let encrypted = encrypt(command);
-///
-/// // First 4 bytes are the length header
-/// assert_eq!(encrypted.len(), 4 + command.len());
-/// ```
-pub fn encrypt(plaintext: &str) -> Vec<u8> {
-    let mut key: u8 = 171;
-    let bytes = plaintext.as_bytes();
-    let len = bytes.len() as u32;
-
-    let mut result = Vec::with_capacity(4 + bytes.len());
-    result.extend_from_slice(&len.to_be_bytes());
-
-    for &byte in bytes {
-        let encrypted = key ^ byte;
-        key = encrypted;
-        result.push(encrypted);
-    }
-
-    result
-}
-
-/// Encrypts for UDP broadcast (no length prefix).
-///
-/// UDP discovery uses the same XOR cipher but without the 4-byte length header.
-fn encrypt_udp(plaintext: &str) -> Vec<u8> {
-    let mut key: u8 = 171;
-    let bytes = plaintext.as_bytes();
-    let mut result = Vec::with_capacity(bytes.len());
-
-    for &byte in bytes {
-        let encrypted = key ^ byte;
-        key = encrypted;
-        result.push(encrypted);
-    }
-
-    result
-}
-
-/// Decrypts ciphertext using the TP-Link Smart Home Protocol.
-///
-/// The decryption uses an XOR autokey cipher with a starting key of 171.
-/// This function expects the raw encrypted payload **without** the 4-byte
-/// length prefix.
+/// This function uses the legacy protocol (TCP port 9999, XOR encryption).
+/// For devices with newer firmware that use KLAP, use [`transport::connect`] instead.
 ///
 /// # Arguments
 ///
-/// * `ciphertext` - The encrypted payload bytes (excluding length header)
-///
-/// # Returns
-///
-/// The decrypted string. Invalid UTF-8 sequences are replaced with the
-/// Unicode replacement character.
-///
-/// # Example
-///
-/// ```
-/// use kasa_core::{encrypt, decrypt};
-///
-/// let original = r#"{"system":{"get_sysinfo":{}}}"#;
-/// let encrypted = encrypt(original);
-///
-/// // Decrypt, skipping the 4-byte length header
-/// let decrypted = decrypt(&encrypted[4..]);
-/// assert_eq!(original, decrypted);
-/// ```
-pub fn decrypt(ciphertext: &[u8]) -> String {
-    let mut key: u8 = 171;
-    let mut result = Vec::with_capacity(ciphertext.len());
-
-    for &byte in ciphertext {
-        let decrypted = key ^ byte;
-        key = byte;
-        result.push(decrypted);
-    }
-
-    String::from_utf8_lossy(&result).to_string()
-}
-
-/// Sends a command to a TP-Link Kasa device and returns the response.
-///
-/// This function establishes a TCP connection to the specified device,
-/// sends an encrypted command, and returns the decrypted response.
-///
-/// # Arguments
-///
-/// * `target` - Hostname or IP address of the device (e.g., "192.168.1.100" or "my-plug.local")
+/// * `target` - Hostname or IP address of the device
 /// * `port` - TCP port number (typically [`DEFAULT_PORT`] which is 9999)
 /// * `command_timeout` - Connection and I/O timeout
-/// * `command` - JSON command string to send (see [`commands`] module for predefined commands)
+/// * `command` - JSON command string to send
 ///
 /// # Returns
 ///
@@ -583,107 +274,52 @@ pub fn decrypt(ciphertext: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// Returns an `io::Error` if:
-/// - The hostname cannot be resolved
-/// - The connection times out or fails
-/// - The device response is malformed (less than 4 bytes)
+/// Returns an `io::Error` if the connection fails or times out.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use std::time::Duration;
 /// use kasa_core::{commands, send_command, DEFAULT_PORT, DEFAULT_TIMEOUT};
 ///
 /// #[tokio::main]
 /// async fn main() -> std::io::Result<()> {
-///     // Get device information
 ///     let response = send_command(
 ///         "192.168.1.100",
 ///         DEFAULT_PORT,
 ///         DEFAULT_TIMEOUT,
 ///         commands::INFO,
 ///     ).await?;
-///
-///     println!("Device info: {}", response);
+///     println!("{}", response);
 ///     Ok(())
 /// }
 /// ```
-///
-/// # Protocol Details
-///
-/// The function performs the following steps:
-/// 1. Resolves the target hostname to a socket address
-/// 2. Establishes a TCP connection with the specified timeout
-/// 3. Encrypts the command using [`encrypt`]
-/// 4. Sends the encrypted message
-/// 5. Receives and decrypts the response using [`decrypt`]
 pub async fn send_command(
     target: &str,
     port: u16,
     command_timeout: Duration,
     command: &str,
 ) -> std::io::Result<String> {
-    let addr = format!("{}:{}", target, port);
-    debug!("Connecting to {}", addr);
+    use transport::LegacyTransport;
 
-    // Connect with timeout
-    let mut stream = timeout(command_timeout, TcpStream::connect(&addr))
+    let mut transport = LegacyTransport::new(target, port, command_timeout);
+    transport
+        .send(command)
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"))??;
-
-    debug!("Connected to {}", addr);
-
-    let encrypted = encrypt(command);
-    debug!("Sending {} bytes", encrypted.len());
-
-    // Write with timeout
-    timeout(command_timeout, stream.write_all(&encrypted))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Write timed out"))??;
-
-    // Read the 4-byte length header first
-    let mut len_buf = [0u8; 4];
-    timeout(command_timeout, stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Read timed out"))??;
-
-    let payload_len = u32::from_be_bytes(len_buf) as usize;
-    debug!("Response payload length: {} bytes", payload_len);
-
-    // Read the full payload
-    let mut payload = vec![0u8; payload_len];
-    timeout(command_timeout, stream.read_exact(&mut payload))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Read timed out"))??;
-
-    debug!("Received {} bytes", payload_len);
-
-    let decrypted = decrypt(&payload);
-    Ok(decrypted)
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Discovers Kasa devices on the local network using UDP broadcast.
 ///
 /// This function sends a UDP broadcast to find all Kasa devices on the local
-/// network. Devices respond with their system information, which is parsed
-/// and returned as a list of [`DiscoveredDevice`] structs.
+/// network. Note that devices using KLAP may not respond to legacy discovery.
 ///
 /// # Arguments
 ///
 /// * `discovery_timeout` - How long to wait for device responses.
-///   Use [`DEFAULT_DISCOVERY_TIMEOUT`] for a reasonable default (3 seconds).
 ///
 /// # Returns
 ///
-/// A vector of discovered devices. The vector may be empty if no devices
-/// are found or if there are network issues.
-///
-/// # Errors
-///
-/// Returns an `io::Error` if:
-/// - Unable to bind to a UDP socket
-/// - Unable to enable broadcast mode
-/// - Unable to send the discovery packet
+/// A vector of discovered devices.
 ///
 /// # Example
 ///
@@ -693,24 +329,17 @@ pub async fn send_command(
 /// #[tokio::main]
 /// async fn main() -> std::io::Result<()> {
 ///     let devices = discover(DEFAULT_DISCOVERY_TIMEOUT).await?;
-///
 ///     for device in devices {
 ///         println!("Found: {} ({}) at {}", device.alias, device.model, device.ip);
 ///     }
 ///     Ok(())
 /// }
 /// ```
-///
-/// # Network Requirements
-///
-/// - The calling machine must be on the same network/subnet as the Kasa devices
-/// - UDP broadcast must not be blocked by firewall rules
-/// - Some networks (e.g., guest networks) may isolate devices and prevent discovery
 pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<DiscoveredDevice>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
 
-    let encrypted = encrypt_udp(commands::INFO);
+    let encrypted = crypto::xor::encrypt_udp(commands::INFO);
     debug!("Sending discovery broadcast to {}", BROADCAST_ADDR);
     socket.send_to(&encrypted, BROADCAST_ADDR).await?;
 
@@ -754,6 +383,7 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                         rssi: info.rssi,
                         on_time: info.on_time,
                         updating: info.updating == 1,
+                        encryption_type: EncryptionType::Xor, // Legacy discovery
                     });
                 }
             }
@@ -762,7 +392,6 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                 break;
             }
             Err(_) => {
-                // Timeout
                 debug!("Discovery timeout reached");
                 break;
             }
@@ -776,7 +405,7 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
 /// Broadcasts a command to all discovered Kasa devices on the local network.
 ///
 /// This function first discovers all devices, then sends the specified command
-/// to each device in parallel. Results are collected and returned for each device.
+/// to each device in parallel using the legacy XOR protocol.
 ///
 /// # Arguments
 ///
@@ -787,37 +416,11 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
 /// # Returns
 ///
 /// A vector of [`BroadcastResult`] containing the result for each discovered device.
-///
-/// # Example
-///
-/// ```no_run
-/// use kasa_core::{broadcast, commands, DEFAULT_DISCOVERY_TIMEOUT, DEFAULT_TIMEOUT};
-///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
-///     // Turn off all devices
-///     let results = broadcast(
-///         DEFAULT_DISCOVERY_TIMEOUT,
-///         DEFAULT_TIMEOUT,
-///         commands::RELAY_OFF,
-///     ).await?;
-///
-///     for result in results {
-///         if result.success {
-///             println!("{}: OK", result.alias);
-///         } else {
-///             println!("{}: FAILED - {}", result.alias, result.error.unwrap_or_default());
-///         }
-///     }
-///     Ok(())
-/// }
-/// ```
 pub async fn broadcast(
     discovery_timeout: Duration,
     command_timeout: Duration,
     command: &str,
 ) -> std::io::Result<Vec<BroadcastResult>> {
-    // First, discover all devices
     let devices = discover(discovery_timeout).await?;
     debug!("Broadcasting command to {} devices", devices.len());
 
@@ -825,7 +428,6 @@ pub async fn broadcast(
         return Ok(Vec::new());
     }
 
-    // Send command to all devices in parallel
     let command = command.to_string();
     let futures: Vec<_> = devices
         .into_iter()
@@ -872,7 +474,6 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip() {
         let original = r#"{"system":{"get_sysinfo":{}}}"#;
         let encrypted = encrypt(original);
-        // Skip the 4-byte length header for decryption
         let decrypted = decrypt(&encrypted[4..]);
         assert_eq!(original, decrypted);
     }
@@ -881,7 +482,6 @@ mod tests {
     fn test_encrypt_has_length_header() {
         let input = "test";
         let encrypted = encrypt(input);
-        // First 4 bytes should be the length in big-endian
         let len = u32::from_be_bytes([encrypted[0], encrypted[1], encrypted[2], encrypted[3]]);
         assert_eq!(len as usize, input.len());
     }
@@ -897,21 +497,5 @@ mod tests {
         let input = "hello world";
         let encrypted = encrypt(input);
         assert_eq!(encrypted.len(), 4 + input.len());
-    }
-
-    #[test]
-    fn test_encrypt_udp_no_length_header() {
-        let input = "test";
-        let encrypted = encrypt_udp(input);
-        // UDP encryption has no length header
-        assert_eq!(encrypted.len(), input.len());
-    }
-
-    #[test]
-    fn test_encrypt_udp_decrypt_roundtrip() {
-        let original = r#"{"system":{"get_sysinfo":{}}}"#;
-        let encrypted = encrypt_udp(original);
-        let decrypted = decrypt(&encrypted);
-        assert_eq!(original, decrypted);
     }
 }
