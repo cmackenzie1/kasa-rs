@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Credentials, error::Error};
+use crate::{Credentials, DiscoveredDevice, error::Error};
 
 /// Default timeout for transport operations.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -103,6 +103,25 @@ impl DeviceConfig {
     pub fn with_https(mut self, https: bool) -> Self {
         self.https = https;
         self
+    }
+
+    /// Creates a device configuration from a discovered device.
+    ///
+    /// This sets the host and port based on discovery results, allowing
+    /// `connect()` to use the appropriate protocol without probing.
+    ///
+    /// Credentials must still be added separately if required:
+    ///
+    /// ```no_run
+    /// use kasa_core::{Credentials, DiscoveredDevice, transport::DeviceConfig};
+    ///
+    /// fn connect_to_discovered(device: &DiscoveredDevice) -> DeviceConfig {
+    ///     DeviceConfig::from_discovered(device)
+    ///         .with_credentials(Credentials::new("user@example.com", "password"))
+    /// }
+    /// ```
+    pub fn from_discovered(device: &DiscoveredDevice) -> Self {
+        Self::new(device.ip.to_string()).with_port(device.port)
     }
 }
 
