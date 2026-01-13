@@ -1,8 +1,11 @@
-use std::{io::IsTerminal, time::Duration};
+use std::{io::IsTerminal, sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
 use kasa_core::{
-    Credentials, DEFAULT_PORT, broadcast, commands, discovery, send_command,
+    Credentials, DEFAULT_PORT, broadcast, commands, discovery,
+    error::Error as KasaError,
+    response::EnergyReading,
+    send_command,
     transport::{DeviceConfig, Transport, TransportExt, connect},
 };
 use tracing::{debug, error};
@@ -449,7 +452,7 @@ async fn main() {
 
                 debug!("Connecting to {} with auto-detection", target);
                 match connect(config).await {
-                    Ok(mut transport) => {
+                    Ok(transport) => {
                         debug!(
                             "Connected using {} protocol on port {}",
                             transport.encryption_type(),
@@ -458,7 +461,9 @@ async fn main() {
 
                         // Handle energy command specially for power strips
                         if matches!(command, DeviceCommand::Energy) && plug.is_none() {
-                            match handle_energy_command(&mut transport).await {
+                            // Convert Box to Arc for concurrent access
+                            let transport: Arc<dyn Transport> = Arc::from(transport);
+                            match handle_energy_command(transport).await {
                                 Ok(()) => {}
                                 Err(e) => {
                                     error!("Energy command failed: {}", e);
@@ -471,7 +476,7 @@ async fn main() {
                             let command_json = match build_command_json_with_transport(
                                 &command,
                                 &plug,
-                                &mut transport,
+                                transport.as_ref(),
                             )
                             .await
                             {
@@ -713,7 +718,7 @@ async fn build_command_json_legacy(
 async fn build_command_json_with_transport(
     command: &DeviceCommand,
     plug: &Option<String>,
-    transport: &mut Box<dyn Transport>,
+    transport: &dyn Transport,
 ) -> Result<String, String> {
     // Resolve plug ID if specified
     let child_id = match plug {
@@ -807,7 +812,7 @@ async fn resolve_child_id_legacy(
 /// Resolve a plug slot number or ID using an existing transport.
 async fn resolve_child_id_with_transport(
     plug_arg: &str,
-    transport: &mut Box<dyn Transport>,
+    transport: &dyn Transport,
 ) -> Result<String, String> {
     // Check if it's a slot number (0-9) or a full ID
     if plug_arg.len() <= 2 && plug_arg.chars().all(|c| c.is_ascii_digit()) {
@@ -916,8 +921,8 @@ fn print_wifi_join_success(ssid: &str) {
 ///
 /// For single devices, returns the standard energy response.
 /// For power strips (devices with children), returns energy readings for all plugs
-/// in a single batched request.
-async fn handle_energy_command(transport: &mut Box<dyn Transport>) -> Result<(), String> {
+/// concurrently for better performance.
+async fn handle_energy_command(transport: Arc<dyn Transport>) -> Result<(), String> {
     // First get sysinfo to check if this is a power strip
     let sysinfo = transport
         .get_sysinfo()
@@ -925,18 +930,26 @@ async fn handle_energy_command(transport: &mut Box<dyn Transport>) -> Result<(),
         .map_err(|e| format!("Failed to get device info: {}", e))?;
 
     if sysinfo.is_power_strip() {
-        // Power strip - get energy for all plugs
+        // Power strip - get energy for all plugs concurrently
         debug!(
-            "Device is a power strip with {} plugs, fetching all energy readings",
+            "Device is a power strip with {} plugs, fetching all energy readings concurrently",
             sysinfo.children.len()
         );
 
-        let child_ids: Vec<&str> = sysinfo.children.iter().map(|c| c.id.as_str()).collect();
+        // Create futures for all child energy requests
+        let futures: Vec<_> = sysinfo
+            .children
+            .iter()
+            .map(|child| {
+                let transport = Arc::clone(&transport);
+                let child_id = child.id.clone();
+                async move { transport.get_energy_for_child(&child_id).await }
+            })
+            .collect();
 
-        let readings = transport
-            .get_energy_for_children(&child_ids)
-            .await
-            .map_err(|e| format!("Failed to get energy readings: {}", e))?;
+        // Execute all requests concurrently
+        let results: Vec<Result<EnergyReading, KasaError>> =
+            futures::future::join_all(futures).await;
 
         // Build response JSON matching the format users expect
         // Include child info (alias, slot) alongside energy data
@@ -950,18 +963,28 @@ async fn handle_energy_command(transport: &mut Box<dyn Transport>) -> Result<(),
         });
 
         let plugs = output["plugs"].as_array_mut().unwrap();
-        for (slot, (child, reading)) in sysinfo.children.iter().zip(readings.iter()).enumerate() {
+        for (slot, (child, result)) in sysinfo.children.iter().zip(results.iter()).enumerate() {
+            let energy = match result {
+                Ok(reading) => serde_json::json!({
+                    "voltage_v": reading.voltage_v(),
+                    "current_a": reading.current_a(),
+                    "power_w": reading.power_w(),
+                    "total_wh": reading.total_wh(),
+                }),
+                Err(e) => {
+                    debug!("Failed to get energy for plug {}: {}", slot, e);
+                    serde_json::json!({
+                        "error": e.to_string()
+                    })
+                }
+            };
+
             plugs.push(serde_json::json!({
                 "slot": slot,
                 "id": child.id,
                 "alias": child.alias,
                 "state": if child.is_on() { "on" } else { "off" },
-                "energy": {
-                    "voltage_v": reading.voltage_v(),
-                    "current_a": reading.current_a(),
-                    "power_w": reading.power_w(),
-                    "total_wh": reading.total_wh(),
-                }
+                "energy": energy
             }));
         }
 

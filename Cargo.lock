@@ -799,6 +799,7 @@ name = "kasa"
 version = "0.4.0"
 dependencies = [
  "clap",
+ "futures",
  "kasa-core",
  "rpassword",
  "serde_json",
