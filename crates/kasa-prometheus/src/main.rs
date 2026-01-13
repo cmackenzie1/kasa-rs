@@ -24,8 +24,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use clap::Parser;
 use kasa_core::{
-    Credentials,
-    discovery::{self, DiscoveredDevice},
+    Credentials, DiscoveredDevice, discovery,
+    response::{CloudInfoResponse, EmeterResponse, SysInfoResponse},
     transport::{DeviceConfig, EncryptionType, Transport, connect},
 };
 use prometheus_client::{encoding::text::encode, registry::Registry};
@@ -239,11 +239,8 @@ async fn poll_discovered_device(
         device.alias, device.model, ip, device.encryption_type
     );
 
-    // Build device config based on encryption type
-    let mut config = DeviceConfig::new(&ip).with_timeout(command_timeout);
-
-    // Set port based on device discovery info
-    config = config.with_port(device.port);
+    // Build device config from discovery results
+    let mut config = DeviceConfig::from_discovered(device).with_timeout(command_timeout);
 
     // Add credentials if available and device needs authentication
     if device.encryption_type != EncryptionType::Xor {
@@ -267,29 +264,26 @@ async fn poll_discovered_device(
                 transport.port()
             );
 
-            // Get sysinfo
+            // Get sysinfo using typed response
             match transport.send(kasa_core::commands::INFO).await {
-                Ok(response) => {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
-                        && let Some(sysinfo) = json.get("system").and_then(|s| s.get("get_sysinfo"))
-                    {
-                        let children = sysinfo.get("children").and_then(|c| c.as_array());
+                Ok(response) => match serde_json::from_str::<SysInfoResponse>(&response) {
+                    Ok(sysinfo_response) => {
                         poll_device_with_transport(
                             state,
                             device,
                             &mut transport,
-                            sysinfo,
-                            children,
+                            &sysinfo_response.system.get_sysinfo,
                         )
                         .await;
-                    } else {
+                    }
+                    Err(e) => {
                         warn!(
                             "Invalid sysinfo response from {} ({}): {}",
-                            device.alias, ip, response
+                            device.alias, ip, e
                         );
                         set_basic_device_metrics(state, device);
                     }
-                }
+                },
                 Err(e) => {
                     warn!(
                         "Failed to get sysinfo from {} ({}): {}",
@@ -312,37 +306,13 @@ async fn poll_discovered_device(
 
 /// Set basic device metrics from discovery data when we can't get full info.
 fn set_basic_device_metrics(state: &AppState, device: &DiscoveredDevice) {
-    // Convert discovery::DiscoveredDevice to metrics-compatible format
-    let metrics_device = device_to_metrics(device);
-    state.metrics.set_device_info(&metrics_device);
-    state
-        .metrics
-        .set_relay_state(&metrics_device, device.relay_state);
-    state.metrics.set_led_off(&metrics_device, device.led_off);
-    state.metrics.set_rssi(&metrics_device, device.rssi);
-    state.metrics.set_on_time(&metrics_device, device.on_time);
-    state.metrics.set_updating(&metrics_device, device.updating);
-    state.metrics.set_scrape_success(&metrics_device, false);
-}
-
-/// Convert discovery::DiscoveredDevice to the metrics-compatible kasa_core::DiscoveredDevice
-fn device_to_metrics(device: &DiscoveredDevice) -> kasa_core::DiscoveredDevice {
-    kasa_core::DiscoveredDevice {
-        ip: device.ip,
-        port: device.port,
-        alias: device.alias.clone(),
-        model: device.model.clone(),
-        mac: device.mac.clone(),
-        device_id: device.device_id.clone(),
-        hw_ver: device.hw_ver.clone(),
-        sw_ver: device.sw_ver.clone(),
-        relay_state: device.relay_state,
-        led_off: device.led_off,
-        rssi: device.rssi,
-        on_time: device.on_time,
-        updating: device.updating,
-        encryption_type: device.encryption_type,
-    }
+    state.metrics.set_device_info(device);
+    state.metrics.set_relay_state(device, device.relay_state);
+    state.metrics.set_led_off(device, device.led_off);
+    state.metrics.set_rssi(device, device.rssi);
+    state.metrics.set_on_time(device, device.on_time);
+    state.metrics.set_updating(device, device.updating);
+    state.metrics.set_scrape_success(device, false);
 }
 
 /// Poll a device using an established transport connection.
@@ -350,105 +320,103 @@ async fn poll_device_with_transport(
     state: &AppState,
     device: &DiscoveredDevice,
     transport: &mut Box<dyn Transport>,
-    sysinfo: &serde_json::Value,
-    children: Option<&Vec<serde_json::Value>>,
+    sysinfo: &kasa_core::response::SysInfo,
 ) {
     let ip = device.ip.to_string();
-    let metrics_device = device_to_metrics(device);
 
-    // Update device metrics from sysinfo
-    let relay_state = sysinfo
-        .get("relay_state")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        == 1;
-    let led_off = sysinfo.get("led_off").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-    let rssi = sysinfo.get("rssi").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let on_time = sysinfo.get("on_time").and_then(|v| v.as_u64()).unwrap_or(0);
-    let updating = sysinfo
-        .get("updating")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        == 1;
-
-    // Build metrics device with updated info from sysinfo
-    let updated_device = kasa_core::DiscoveredDevice {
-        alias: sysinfo
-            .get("alias")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&device.alias)
-            .to_string(),
-        sw_ver: sysinfo
-            .get("sw_ver")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&device.sw_ver)
-            .to_string(),
-        hw_ver: sysinfo
-            .get("hw_ver")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&device.hw_ver)
-            .to_string(),
-        relay_state,
-        led_off,
-        rssi,
-        on_time,
-        updating,
-        ..metrics_device.clone()
+    // Build updated device info from sysinfo response
+    let updated_device = DiscoveredDevice {
+        ip: device.ip,
+        port: device.port,
+        mac: if sysinfo.mac_address().is_empty() {
+            device.mac.clone()
+        } else {
+            sysinfo.mac_address().to_string()
+        },
+        device_id: if sysinfo.device_id.is_empty() {
+            device.device_id.clone()
+        } else {
+            sysinfo.device_id.clone()
+        },
+        alias: if sysinfo.alias.is_empty() {
+            device.alias.clone()
+        } else {
+            sysinfo.alias.clone()
+        },
+        model: if sysinfo.model.is_empty() {
+            device.model.clone()
+        } else {
+            sysinfo.model.clone()
+        },
+        hw_ver: if sysinfo.hw_ver.is_empty() {
+            device.hw_ver.clone()
+        } else {
+            sysinfo.hw_ver.clone()
+        },
+        sw_ver: if sysinfo.sw_ver.is_empty() {
+            device.sw_ver.clone()
+        } else {
+            sysinfo.sw_ver.clone()
+        },
+        relay_state: sysinfo.is_on(),
+        led_off: sysinfo.is_led_off(),
+        rssi: sysinfo.rssi,
+        on_time: sysinfo.on_time,
+        updating: sysinfo.is_updating(),
+        encryption_type: device.encryption_type,
+        http_port: device.http_port,
+        new_klap: device.new_klap,
+        login_version: device.login_version,
     };
 
     state.metrics.set_device_info(&updated_device);
-    state.metrics.set_relay_state(&updated_device, relay_state);
-    state.metrics.set_led_off(&updated_device, led_off);
-    state.metrics.set_rssi(&updated_device, rssi);
-    state.metrics.set_on_time(&updated_device, on_time);
-    state.metrics.set_updating(&updated_device, updating);
+    state
+        .metrics
+        .set_relay_state(&updated_device, updated_device.relay_state);
+    state
+        .metrics
+        .set_led_off(&updated_device, updated_device.led_off);
+    state.metrics.set_rssi(&updated_device, updated_device.rssi);
+    state
+        .metrics
+        .set_on_time(&updated_device, updated_device.on_time);
+    state
+        .metrics
+        .set_updating(&updated_device, updated_device.updating);
 
     // Check if this is a power strip with children
-    if let Some(children) = children {
+    if sysinfo.is_power_strip() {
         debug!(
             "{} ({}) is a power strip with {} plugs",
             updated_device.alias,
             updated_device.model,
-            children.len()
+            sysinfo.children.len()
         );
 
         // Set per-plug state from sysinfo
-        for (slot, child) in children.iter().enumerate() {
-            let plug_id = child
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let plug_alias = child
-                .get("alias")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let plug_state = child.get("state").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            let plug_on_time = child.get("on_time").and_then(|v| v.as_u64()).unwrap_or(0);
-
+        for (slot, child) in sysinfo.children.iter().enumerate() {
             let labels = PlugLabels {
                 device_id: updated_device.device_id.clone(),
                 alias: updated_device.alias.clone(),
                 model: updated_device.model.clone(),
                 ip: ip.clone(),
-                plug_id: plug_id.clone(),
-                plug_alias,
+                plug_id: child.id.clone(),
+                plug_alias: child.alias.clone(),
                 plug_slot: slot.to_string(),
             };
 
-            state.metrics.set_plug_relay_state(&labels, plug_state);
-            state.metrics.set_plug_on_time(&labels, plug_on_time);
+            state.metrics.set_plug_relay_state(&labels, child.is_on());
+            state.metrics.set_plug_on_time(&labels, child.on_time);
 
             // Get energy data for this plug
-            let energy_cmd = kasa_core::commands::energy_for_child(&plug_id);
+            let energy_cmd = kasa_core::commands::energy_for_child(&child.id);
             match transport.send(&energy_cmd).await {
                 Ok(response) => {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
-                        && let Some(emeter) = json.get("emeter").and_then(|e| e.get("get_realtime"))
-                        && emeter.get("err_code").and_then(|c| c.as_i64()) == Some(0)
-                    {
-                        parse_plug_energy_metrics(state, &labels, emeter);
+                    if let Ok(emeter_response) = serde_json::from_str::<EmeterResponse>(&response) {
+                        let reading = &emeter_response.emeter.get_realtime;
+                        if reading.is_success() {
+                            set_plug_energy_metrics(state, &labels, reading);
+                        }
                     }
                 }
                 Err(e) => {
@@ -465,26 +433,19 @@ async fn poll_device_with_transport(
         // Single device - try to get energy data (may not be supported by all devices)
         match transport.send(kasa_core::commands::ENERGY).await {
             Ok(response) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                    if let Some(emeter) = json.get("emeter").and_then(|e| e.get("get_realtime")) {
-                        // Check for error
-                        if emeter.get("err_code").and_then(|c| c.as_i64()) == Some(0) {
-                            parse_energy_metrics(state, &updated_device, emeter);
-                            state.metrics.set_scrape_success(&updated_device, true);
-                        } else {
-                            // Device doesn't support energy monitoring
-                            debug!(
-                                "{} ({}) does not support energy monitoring",
-                                updated_device.alias, updated_device.model
-                            );
-                            state.metrics.set_scrape_success(&updated_device, true);
-                        }
+                if let Ok(emeter_response) = serde_json::from_str::<EmeterResponse>(&response) {
+                    let reading = &emeter_response.emeter.get_realtime;
+                    if reading.is_success() {
+                        set_energy_metrics(state, &updated_device, reading);
                     } else {
-                        state.metrics.set_scrape_success(&updated_device, true);
+                        // Device doesn't support energy monitoring
+                        debug!(
+                            "{} ({}) does not support energy monitoring",
+                            updated_device.alias, updated_device.model
+                        );
                     }
-                } else {
-                    state.metrics.set_scrape_success(&updated_device, true);
                 }
+                state.metrics.set_scrape_success(&updated_device, true);
             }
             Err(e) => {
                 warn!(
@@ -499,17 +460,11 @@ async fn poll_device_with_transport(
     // Try to get cloud connection status
     match transport.send(kasa_core::commands::CLOUDINFO).await {
         Ok(response) => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
-                && let Some(cloud) = json.get("cnCloud").and_then(|c| c.get("get_info"))
-            {
-                let connected = cloud
-                    .get("cld_connection")
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0)
-                    == 1;
-                state
-                    .metrics
-                    .set_cloud_connected(&updated_device, connected);
+            if let Ok(cloud_response) = serde_json::from_str::<CloudInfoResponse>(&response) {
+                state.metrics.set_cloud_connected(
+                    &updated_device,
+                    cloud_response.cn_cloud.get_info.is_connected(),
+                );
             }
         }
         Err(e) => {
@@ -549,24 +504,16 @@ async fn poll_targeted_device(
         transport.port()
     );
 
-    // Get sysinfo
+    // Get sysinfo using typed response
     let response = transport
         .send(kasa_core::commands::INFO)
         .await
         .map_err(|e| std::io::Error::other(format!("Command failed: {}", e)))?;
 
-    let json: serde_json::Value = serde_json::from_str(&response)
+    let sysinfo_response: SysInfoResponse = serde_json::from_str(&response)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    let sysinfo = json
-        .get("system")
-        .and_then(|s| s.get("get_sysinfo"))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Missing sysinfo in response",
-            )
-        })?;
+    let sysinfo = &sysinfo_response.system.get_sysinfo;
 
     // Build a DiscoveredDevice from the response
     let device = DiscoveredDevice {
@@ -577,149 +524,65 @@ async fn poll_targeted_device(
             )
         })?,
         port: transport.port(),
-        alias: sysinfo
-            .get("alias")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        model: sysinfo
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        mac: sysinfo
-            .get("mac")
-            .or_else(|| sysinfo.get("mic_mac"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        device_id: sysinfo
-            .get("deviceId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        hw_ver: sysinfo
-            .get("hw_ver")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        sw_ver: sysinfo
-            .get("sw_ver")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        relay_state: sysinfo
-            .get("relay_state")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            == 1,
-        led_off: sysinfo.get("led_off").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-        rssi: sysinfo.get("rssi").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-        on_time: sysinfo.get("on_time").and_then(|v| v.as_u64()).unwrap_or(0),
-        updating: sysinfo
-            .get("updating")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            == 1,
+        alias: sysinfo.alias.clone(),
+        model: sysinfo.model.clone(),
+        mac: sysinfo.mac_address().to_string(),
+        device_id: sysinfo.device_id.clone(),
+        hw_ver: sysinfo.hw_ver.clone(),
+        sw_ver: sysinfo.sw_ver.clone(),
+        relay_state: sysinfo.is_on(),
+        led_off: sysinfo.is_led_off(),
+        rssi: sysinfo.rssi,
+        on_time: sysinfo.on_time,
+        updating: sysinfo.is_updating(),
         encryption_type: transport.encryption_type(),
         http_port: None,
         new_klap: None,
         login_version: None,
     };
 
-    // Check if this is a power strip with children
-    let children = sysinfo.get("children").and_then(|c| c.as_array());
-
     // Now poll for additional data using the established transport
-    poll_device_with_transport(state, &device, &mut transport, sysinfo, children).await;
+    poll_device_with_transport(state, &device, &mut transport, sysinfo).await;
 
     Ok(())
 }
 
-/// Parse energy meter response and update metrics for a plug
-fn parse_plug_energy_metrics(state: &AppState, labels: &PlugLabels, emeter: &serde_json::Value) {
-    // Voltage (may be in voltage_mv or voltage)
-    if let Some(voltage) = emeter
-        .get("voltage_mv")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("voltage").and_then(|v| v.as_f64()))
-    {
+/// Set energy metrics for a plug using typed EnergyReading.
+fn set_plug_energy_metrics(
+    state: &AppState,
+    labels: &PlugLabels,
+    reading: &kasa_core::response::EnergyReading,
+) {
+    if let Some(voltage) = reading.voltage_v() {
         state.metrics.set_plug_voltage(labels, voltage);
     }
-
-    // Current (may be in current_ma or current)
-    if let Some(current) = emeter
-        .get("current_ma")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("current").and_then(|v| v.as_f64()))
-    {
+    if let Some(current) = reading.current_a() {
         state.metrics.set_plug_current(labels, current);
     }
-
-    // Power (may be in power_mw or power)
-    if let Some(power) = emeter
-        .get("power_mw")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("power").and_then(|v| v.as_f64()))
-    {
+    if let Some(power) = reading.power_w() {
         state.metrics.set_plug_power(labels, power);
     }
-
-    // Total energy (may be in total_wh or total)
-    if let Some(total) = emeter
-        .get("total_wh")
-        .and_then(|v| v.as_f64())
-        .or_else(|| emeter.get("total").and_then(|v| v.as_f64()))
-    {
+    if let Some(total) = reading.total_wh() {
         state.metrics.set_plug_energy_total(labels, total);
     }
 }
 
-/// Parse energy meter response and update metrics
-fn parse_energy_metrics(
+/// Set energy metrics for a device using typed EnergyReading.
+fn set_energy_metrics(
     state: &AppState,
-    device: &kasa_core::DiscoveredDevice,
-    emeter: &serde_json::Value,
+    device: &DiscoveredDevice,
+    reading: &kasa_core::response::EnergyReading,
 ) {
-    // Voltage (may be in voltage_mv or voltage)
-    if let Some(voltage) = emeter
-        .get("voltage_mv")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("voltage").and_then(|v| v.as_f64()))
-    {
+    if let Some(voltage) = reading.voltage_v() {
         state.metrics.set_voltage(device, voltage);
     }
-
-    // Current (may be in current_ma or current)
-    if let Some(current) = emeter
-        .get("current_ma")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("current").and_then(|v| v.as_f64()))
-    {
+    if let Some(current) = reading.current_a() {
         state.metrics.set_current(device, current);
     }
-
-    // Power (may be in power_mw or power)
-    if let Some(power) = emeter
-        .get("power_mw")
-        .and_then(|v| v.as_f64())
-        .map(|v| v / 1000.0)
-        .or_else(|| emeter.get("power").and_then(|v| v.as_f64()))
-    {
+    if let Some(power) = reading.power_w() {
         state.metrics.set_power(device, power);
     }
-
-    // Total energy (may be in total_wh or total)
-    if let Some(total) = emeter
-        .get("total_wh")
-        .and_then(|v| v.as_f64())
-        .or_else(|| emeter.get("total").and_then(|v| v.as_f64()))
-    {
+    if let Some(total) = reading.total_wh() {
         state.metrics.set_energy_total(device, total);
     }
 }
