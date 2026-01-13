@@ -921,77 +921,20 @@ fn print_wifi_join_success(ssid: &str) {
     eprintln!("  kasa discover");
 }
 
-/// Handle the energy command, detecting power strips and returning all plug readings.
+/// Handle the energy command using the unified get_all_energy() method.
 ///
-/// For single devices, returns the standard energy response.
-/// For power strips (devices with children), returns energy readings for all plugs.
-///
-/// Note: Requests are made sequentially because TP-Link devices cannot handle
-/// concurrent requests reliably - they return errors when multiple requests
-/// arrive simultaneously.
+/// This automatically handles both single devices and power strips,
+/// returning energy readings for all plugs.
 async fn handle_energy_command(transport: &dyn Transport) -> Result<(), String> {
-    // First get sysinfo to check if this is a power strip
-    let sysinfo = transport
-        .get_sysinfo()
+    let energy = transport
+        .get_all_energy()
         .await
-        .map_err(|e| format!("Failed to get device info: {}", e))?;
+        .map_err(|e| format!("Failed to get energy: {}", e))?;
 
-    if sysinfo.is_power_strip() {
-        // Power strip - get energy for all plugs sequentially
-        // (device cannot handle concurrent requests)
-        debug!(
-            "Device is a power strip with {} plugs, fetching energy readings",
-            sysinfo.children.len()
-        );
+    // Output as JSON
+    let output = serde_json::to_string_pretty(&energy)
+        .map_err(|e| format!("Failed to serialize energy data: {}", e))?;
 
-        // Build response JSON
-        let mut output = serde_json::json!({
-            "device": {
-                "alias": sysinfo.alias,
-                "model": sysinfo.model,
-                "device_id": sysinfo.device_id,
-            },
-            "plugs": []
-        });
-
-        let plugs = output["plugs"].as_array_mut().unwrap();
-        for (slot, child) in sysinfo.children.iter().enumerate() {
-            let energy = match transport.get_energy_for_child(&child.id).await {
-                Ok(reading) => serde_json::json!({
-                    "voltage_v": reading.voltage_v(),
-                    "current_a": reading.current_a(),
-                    "power_w": reading.power_w(),
-                    "total_wh": reading.total_wh(),
-                }),
-                Err(e) => {
-                    debug!("Failed to get energy for plug {}: {}", slot, e);
-                    serde_json::json!({
-                        "error": e.to_string()
-                    })
-                }
-            };
-
-            plugs.push(serde_json::json!({
-                "slot": slot,
-                "id": child.id,
-                "alias": child.alias,
-                "state": if child.is_on() { "on" } else { "off" },
-                "energy": energy
-            }));
-        }
-
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
-        Ok(())
-    } else {
-        // Single device - get standard energy reading
-        debug!("Device is not a power strip, fetching single energy reading");
-
-        let response = transport
-            .send(commands::ENERGY)
-            .await
-            .map_err(|e| format!("Failed to get energy: {}", e))?;
-
-        print_json_response(&response);
-        Ok(())
-    }
+    println!("{}", output);
+    Ok(())
 }

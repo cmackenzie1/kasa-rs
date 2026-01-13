@@ -348,6 +348,57 @@ pub struct BatchEmeterWrapper {
     pub get_realtime: Vec<EnergyReading>,
 }
 
+/// Unified energy data for a device.
+///
+/// This type provides a consistent interface for energy readings regardless
+/// of whether the device is a single plug or a power strip with multiple outlets.
+///
+/// # Example
+///
+/// ```no_run
+/// use kasa_core::transport::{DeviceConfig, connect, TransportExt};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let transport = connect(DeviceConfig::new("192.168.1.100")).await?;
+///     let energy = transport.get_all_energy().await?;
+///     
+///     println!("Device: {} ({})", energy.alias, energy.model);
+///     for plug in &energy.plugs {
+///         if let Some(power) = plug.energy.power_w() {
+///             println!("  {}: {:.1}W", plug.alias, power);
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceEnergy {
+    /// Device alias/name.
+    pub alias: String,
+    /// Device model.
+    pub model: String,
+    /// Device ID.
+    pub device_id: String,
+    /// Energy readings for each plug (single element for non-strip devices).
+    pub plugs: Vec<PlugEnergy>,
+}
+
+/// Energy data for a single plug (or outlet on a power strip).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlugEnergy {
+    /// Plug slot number (0 for single devices).
+    pub slot: usize,
+    /// Plug ID (same as device_id for single devices).
+    pub id: String,
+    /// Plug alias/name.
+    pub alias: String,
+    /// Whether the plug is on.
+    pub is_on: bool,
+    /// Energy reading for this plug.
+    pub energy: EnergyReading,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

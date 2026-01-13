@@ -379,6 +379,12 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
 /// to configure the connection with the appropriate encryption hint. This ensures
 /// devices using KLAP or TPAP protocols are handled correctly when credentials
 /// are provided.
+///
+/// # Energy Command Handling
+///
+/// For energy commands (`{"emeter":{"get_realtime":{}}}`), this function
+/// automatically uses [`TransportExt::get_all_energy`] to fetch energy data
+/// for all plugs on power strips, not just the first plug.
 pub async fn broadcast(
     discovery_timeout: Duration,
     command_timeout: Duration,
@@ -394,6 +400,7 @@ pub async fn broadcast(
 
     let command = command.to_string();
     let credentials = credentials.map(std::sync::Arc::new);
+    let is_energy_command = command.contains("emeter") && command.contains("get_realtime");
 
     let futures: Vec<_> = devices
         .into_iter()
@@ -410,23 +417,42 @@ pub async fn broadcast(
                 }
 
                 // Try to connect using the appropriate protocol
-                let result = match transport::connect(config).await {
-                    Ok(transport) => transport.send(&cmd).await,
-                    Err(e) => Err(e),
-                };
-
-                match result {
-                    Ok(response) => {
-                        let json_response = serde_json::from_str(&response).ok();
-                        BroadcastResult {
+                let transport = match transport::connect(config).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return BroadcastResult {
                             ip: device.ip,
                             alias: device.alias,
                             model: device.model,
-                            success: true,
-                            response: json_response,
-                            error: None,
-                        }
+                            success: false,
+                            response: None,
+                            error: Some(e.to_string()),
+                        };
                     }
+                };
+
+                // Use get_all_energy() for energy commands to handle power strips
+                let result = if is_energy_command {
+                    transport
+                        .get_all_energy()
+                        .await
+                        .map(|energy| serde_json::to_value(&energy).ok())
+                } else {
+                    transport
+                        .send(&cmd)
+                        .await
+                        .map(|response| serde_json::from_str(&response).ok())
+                };
+
+                match result {
+                    Ok(json_response) => BroadcastResult {
+                        ip: device.ip,
+                        alias: device.alias,
+                        model: device.model,
+                        success: true,
+                        response: json_response,
+                        error: None,
+                    },
                     Err(e) => BroadcastResult {
                         ip: device.ip,
                         alias: device.alias,

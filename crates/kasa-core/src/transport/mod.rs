@@ -388,13 +388,19 @@ pub trait TransportExt: Transport {
     /// current relay state, and for power strips, information about each child plug.
     async fn get_sysinfo(&self) -> Result<crate::response::SysInfo, Error>;
 
-    /// Gets real-time energy meter readings.
+    /// Gets real-time energy meter readings for a single-outlet device.
     ///
     /// Returns voltage, current, power, and total energy consumption.
-    /// Only available on devices with energy monitoring (e.g., HS110, KP115, HS300).
+    /// Only available on devices with energy monitoring (e.g., HS110, KP115).
     ///
     /// The returned [`EnergyReading`](crate::response::EnergyReading) normalizes values
     /// to standard units (volts, amps, watts) regardless of device-specific formats.
+    ///
+    /// # Power Strips
+    ///
+    /// For power strips (e.g., HS300) with multiple outlets, use [`get_all_energy`](Self::get_all_energy)
+    /// instead. This method only returns energy for the device itself, not individual plugs.
+    /// Calling this on a power strip may return an error or incomplete data.
     async fn get_energy(&self) -> Result<crate::response::EnergyReading, Error>;
 
     /// Gets cloud connection information.
@@ -417,6 +423,9 @@ pub trait TransportExt: Transport {
     async fn set_led_off(&self, off: bool) -> Result<(), Error>;
 
     /// Gets energy meter readings for a specific child plug on a power strip.
+    ///
+    /// Use this when you need energy data for a single specific plug.
+    /// For all plugs at once, prefer [`get_all_energy`](Self::get_all_energy).
     ///
     /// # Arguments
     ///
@@ -458,6 +467,34 @@ pub trait TransportExt: Transport {
     ///
     /// The device will restart after a 1-second delay.
     async fn reboot(&self) -> Result<(), Error>;
+
+    /// Gets energy readings for the entire device.
+    ///
+    /// This is the recommended way to get energy data as it handles both
+    /// single devices and power strips automatically:
+    ///
+    /// - **Single devices**: Returns one plug entry with the device's energy reading
+    /// - **Power strips**: Returns entries for all child plugs
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use kasa_core::transport::{DeviceConfig, connect, TransportExt};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let transport = connect(DeviceConfig::new("192.168.1.100")).await?;
+    ///     let energy = transport.get_all_energy().await?;
+    ///     
+    ///     for plug in &energy.plugs {
+    ///         if let Some(power) = plug.energy.power_w() {
+    ///             println!("{}: {:.1}W", plug.alias, power);
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    async fn get_all_energy(&self) -> Result<crate::response::DeviceEnergy, Error>;
 }
 
 #[async_trait]
@@ -569,5 +606,53 @@ impl<T: Transport + ?Sized + Send + Sync> TransportExt for T {
     async fn reboot(&self) -> Result<(), Error> {
         self.send(crate::commands::REBOOT).await?;
         Ok(())
+    }
+
+    async fn get_all_energy(&self) -> Result<crate::response::DeviceEnergy, Error> {
+        // Get device info first to determine device type
+        let sysinfo = self.get_sysinfo().await?;
+
+        let plugs = if sysinfo.is_power_strip() {
+            // Power strip - get energy for all children
+            let mut plugs = Vec::with_capacity(sysinfo.children.len());
+
+            for (slot, child) in sysinfo.children.iter().enumerate() {
+                let energy = match self.get_energy_for_child(&child.id).await {
+                    Ok(reading) => reading,
+                    Err(e) => {
+                        tracing::debug!("Failed to get energy for child {}: {}", child.id, e);
+                        crate::response::EnergyReading::default()
+                    }
+                };
+
+                plugs.push(crate::response::PlugEnergy {
+                    slot,
+                    id: child.id.clone(),
+                    alias: child.alias.clone(),
+                    is_on: child.is_on(),
+                    energy,
+                });
+            }
+
+            plugs
+        } else {
+            // Single device - get one energy reading
+            let energy = self.get_energy().await.unwrap_or_default();
+
+            vec![crate::response::PlugEnergy {
+                slot: 0,
+                id: sysinfo.device_id.clone(),
+                alias: sysinfo.alias.clone(),
+                is_on: sysinfo.is_on(),
+                energy,
+            }]
+        };
+
+        Ok(crate::response::DeviceEnergy {
+            alias: sysinfo.alias,
+            model: sysinfo.model,
+            device_id: sysinfo.device_id,
+            plugs,
+        })
     }
 }
