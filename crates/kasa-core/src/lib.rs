@@ -359,23 +359,33 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
 /// Broadcasts a command to all discovered Kasa devices on the local network.
 ///
 /// This function first discovers all devices, then sends the specified command
-/// to each device in parallel using the legacy XOR protocol.
+/// to each device concurrently. It uses the appropriate protocol for each device
+/// based on discovery results (encryption hints).
 ///
 /// # Arguments
 ///
 /// * `discovery_timeout` - How long to wait for device discovery
 /// * `command_timeout` - Timeout for each device command
 /// * `command` - JSON command string to send to all devices
+/// * `credentials` - Optional TP-Link cloud credentials for KLAP/TPAP devices
 ///
 /// # Returns
 ///
 /// A vector of [`BroadcastResult`] containing the result for each discovered device.
+///
+/// # Protocol Selection
+///
+/// For each discovered device, the function uses [`DeviceConfig::from_discovered`]
+/// to configure the connection with the appropriate encryption hint. This ensures
+/// devices using KLAP or TPAP protocols are handled correctly when credentials
+/// are provided.
 pub async fn broadcast(
     discovery_timeout: Duration,
     command_timeout: Duration,
     command: &str,
+    credentials: Option<Credentials>,
 ) -> std::io::Result<Vec<BroadcastResult>> {
-    let devices = discover(discovery_timeout).await?;
+    let devices = discovery::discover_all(discovery_timeout).await?;
     debug!("Broadcasting command to {} devices", devices.len());
 
     if devices.is_empty() {
@@ -383,13 +393,27 @@ pub async fn broadcast(
     }
 
     let command = command.to_string();
+    let credentials = credentials.map(std::sync::Arc::new);
+
     let futures: Vec<_> = devices
         .into_iter()
         .map(|device| {
             let cmd = command.clone();
+            let creds = credentials.clone();
             async move {
-                let result =
-                    send_command(&device.ip.to_string(), device.port, command_timeout, &cmd).await;
+                // Build config from discovered device (includes encryption hint)
+                let mut config =
+                    DeviceConfig::from_discovered(&device).with_timeout(command_timeout);
+
+                if let Some(creds) = creds {
+                    config = config.with_credentials((*creds).clone());
+                }
+
+                // Try to connect using the appropriate protocol
+                let result = match transport::connect(config).await {
+                    Ok(transport) => transport.send(&cmd).await,
+                    Err(e) => Err(e),
+                };
 
                 match result {
                     Ok(response) => {
