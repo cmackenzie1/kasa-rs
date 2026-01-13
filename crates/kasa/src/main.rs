@@ -456,27 +456,39 @@ async fn main() {
                             transport.port()
                         );
 
-                        // Build command JSON using the established transport
-                        let command_json = match build_command_json_with_transport(
-                            &command,
-                            &plug,
-                            &mut transport,
-                        )
-                        .await
-                        {
-                            Ok(json) => json,
-                            Err(e) => {
-                                eprintln!("Error: {}", e);
-                                std::process::exit(1);
+                        // Handle energy command specially for power strips
+                        if matches!(command, DeviceCommand::Energy) && plug.is_none() {
+                            match handle_energy_command(&mut transport).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!("Energy command failed: {}", e);
+                                    eprintln!("Error: {}", e);
+                                    std::process::exit(1);
+                                }
                             }
-                        };
+                        } else {
+                            // Build command JSON using the established transport
+                            let command_json = match build_command_json_with_transport(
+                                &command,
+                                &plug,
+                                &mut transport,
+                            )
+                            .await
+                            {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    eprintln!("Error: {}", e);
+                                    std::process::exit(1);
+                                }
+                            };
 
-                        match transport.send(&command_json).await {
-                            Ok(response) => print_json_response(&response),
-                            Err(e) => {
-                                error!("Command failed: {}", e);
-                                eprintln!("Error: Command failed: {}", e);
-                                std::process::exit(1);
+                            match transport.send(&command_json).await {
+                                Ok(response) => print_json_response(&response),
+                                Err(e) => {
+                                    error!("Command failed: {}", e);
+                                    eprintln!("Error: Command failed: {}", e);
+                                    std::process::exit(1);
+                                }
                             }
                         }
                     }
@@ -898,4 +910,73 @@ fn print_wifi_join_success(ssid: &str) {
     eprintln!("To verify the device joined your network, reconnect to your");
     eprintln!("normal WiFi and run:");
     eprintln!("  kasa discover");
+}
+
+/// Handle the energy command, detecting power strips and returning all plug readings.
+///
+/// For single devices, returns the standard energy response.
+/// For power strips (devices with children), returns energy readings for all plugs
+/// in a single batched request.
+async fn handle_energy_command(transport: &mut Box<dyn Transport>) -> Result<(), String> {
+    // First get sysinfo to check if this is a power strip
+    let sysinfo = transport
+        .get_sysinfo()
+        .await
+        .map_err(|e| format!("Failed to get device info: {}", e))?;
+
+    if sysinfo.is_power_strip() {
+        // Power strip - get energy for all plugs
+        debug!(
+            "Device is a power strip with {} plugs, fetching all energy readings",
+            sysinfo.children.len()
+        );
+
+        let child_ids: Vec<&str> = sysinfo.children.iter().map(|c| c.id.as_str()).collect();
+
+        let readings = transport
+            .get_energy_for_children(&child_ids)
+            .await
+            .map_err(|e| format!("Failed to get energy readings: {}", e))?;
+
+        // Build response JSON matching the format users expect
+        // Include child info (alias, slot) alongside energy data
+        let mut output = serde_json::json!({
+            "device": {
+                "alias": sysinfo.alias,
+                "model": sysinfo.model,
+                "device_id": sysinfo.device_id,
+            },
+            "plugs": []
+        });
+
+        let plugs = output["plugs"].as_array_mut().unwrap();
+        for (slot, (child, reading)) in sysinfo.children.iter().zip(readings.iter()).enumerate() {
+            plugs.push(serde_json::json!({
+                "slot": slot,
+                "id": child.id,
+                "alias": child.alias,
+                "state": if child.is_on() { "on" } else { "off" },
+                "energy": {
+                    "voltage_v": reading.voltage_v(),
+                    "current_a": reading.current_a(),
+                    "power_w": reading.power_w(),
+                    "total_wh": reading.total_wh(),
+                }
+            }));
+        }
+
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        Ok(())
+    } else {
+        // Single device - get standard energy reading
+        debug!("Device is not a power strip, fetching single energy reading");
+
+        let response = transport
+            .send(commands::ENERGY)
+            .await
+            .map_err(|e| format!("Failed to get energy: {}", e))?;
+
+        print_json_response(&response);
+        Ok(())
+    }
 }
