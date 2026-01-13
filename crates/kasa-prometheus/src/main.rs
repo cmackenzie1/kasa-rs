@@ -25,8 +25,7 @@ use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, rou
 use clap::Parser;
 use kasa_core::{
     Credentials, DiscoveredDevice, discovery,
-    response::{CloudInfoResponse, EmeterResponse, SysInfoResponse},
-    transport::{DeviceConfig, EncryptionType, Transport, connect},
+    transport::{DeviceConfig, EncryptionType, Transport, TransportExt, connect},
 };
 use prometheus_client::{encoding::text::encode, registry::Registry};
 use tokio::sync::RwLock;
@@ -280,26 +279,11 @@ async fn poll_discovered_device(
                 transport.port()
             );
 
-            // Get sysinfo using typed response
-            match transport.send(kasa_core::commands::INFO).await {
-                Ok(response) => match serde_json::from_str::<SysInfoResponse>(&response) {
-                    Ok(sysinfo_response) => {
-                        poll_device_with_transport(
-                            state,
-                            device,
-                            &mut transport,
-                            &sysinfo_response.system.get_sysinfo,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Invalid sysinfo response from {} ({}): {}",
-                            device.alias, ip, e
-                        );
-                        set_basic_device_metrics(state, device);
-                    }
-                },
+            // Get sysinfo using TransportExt
+            match transport.get_sysinfo().await {
+                Ok(sysinfo) => {
+                    poll_device_with_transport(state, device, &mut transport, &sysinfo).await;
+                }
                 Err(e) => {
                     warn!(
                         "Failed to get sysinfo from {} ({}): {}",
@@ -424,16 +408,10 @@ async fn poll_device_with_transport(
             state.metrics.set_plug_relay_state(&labels, child.is_on());
             state.metrics.set_plug_on_time(&labels, child.on_time);
 
-            // Get energy data for this plug
-            let energy_cmd = kasa_core::commands::energy_for_child(&child.id);
-            match transport.send(&energy_cmd).await {
-                Ok(response) => {
-                    if let Ok(emeter_response) = serde_json::from_str::<EmeterResponse>(&response) {
-                        let reading = &emeter_response.emeter.get_realtime;
-                        if reading.is_success() {
-                            set_plug_energy_metrics(state, &labels, reading);
-                        }
-                    }
+            // Get energy data for this plug using TransportExt
+            match transport.get_energy_for_child(&child.id).await {
+                Ok(reading) => {
+                    set_plug_energy_metrics(state, &labels, &reading);
                 }
                 Err(e) => {
                     debug!(
@@ -447,41 +425,28 @@ async fn poll_device_with_transport(
         state.metrics.set_scrape_success(&updated_device, true);
     } else {
         // Single device - try to get energy data (may not be supported by all devices)
-        match transport.send(kasa_core::commands::ENERGY).await {
-            Ok(response) => {
-                if let Ok(emeter_response) = serde_json::from_str::<EmeterResponse>(&response) {
-                    let reading = &emeter_response.emeter.get_realtime;
-                    if reading.is_success() {
-                        set_energy_metrics(state, &updated_device, reading);
-                    } else {
-                        // Device doesn't support energy monitoring
-                        debug!(
-                            "{} ({}) does not support energy monitoring",
-                            updated_device.alias, updated_device.model
-                        );
-                    }
-                }
+        match transport.get_energy().await {
+            Ok(reading) => {
+                set_energy_metrics(state, &updated_device, &reading);
                 state.metrics.set_scrape_success(&updated_device, true);
             }
             Err(e) => {
-                warn!(
-                    "Failed to get energy data from {}: {}",
-                    updated_device.alias, e
+                // Energy monitoring not supported is not a failure
+                debug!(
+                    "{} ({}) energy query failed: {}",
+                    updated_device.alias, updated_device.model, e
                 );
-                state.metrics.set_scrape_success(&updated_device, false);
+                state.metrics.set_scrape_success(&updated_device, true);
             }
         }
     }
 
     // Try to get cloud connection status
-    match transport.send(kasa_core::commands::CLOUDINFO).await {
-        Ok(response) => {
-            if let Ok(cloud_response) = serde_json::from_str::<CloudInfoResponse>(&response) {
-                state.metrics.set_cloud_connected(
-                    &updated_device,
-                    cloud_response.cn_cloud.get_info.is_connected(),
-                );
-            }
+    match transport.get_cloud_info().await {
+        Ok(cloud_info) => {
+            state
+                .metrics
+                .set_cloud_connected(&updated_device, cloud_info.is_connected());
         }
         Err(e) => {
             debug!(
@@ -520,16 +485,11 @@ async fn poll_targeted_device(
         transport.port()
     );
 
-    // Get sysinfo using typed response
-    let response = transport
-        .send(kasa_core::commands::INFO)
+    // Get sysinfo using TransportExt
+    let sysinfo = transport
+        .get_sysinfo()
         .await
-        .map_err(|e| std::io::Error::other(format!("Command failed: {}", e)))?;
-
-    let sysinfo_response: SysInfoResponse = serde_json::from_str(&response)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let sysinfo = &sysinfo_response.system.get_sysinfo;
+        .map_err(|e| std::io::Error::other(format!("Failed to get sysinfo: {}", e)))?;
 
     // Build a DiscoveredDevice from the response
     let device = DiscoveredDevice {
@@ -558,7 +518,7 @@ async fn poll_targeted_device(
     };
 
     // Now poll for additional data using the established transport
-    poll_device_with_transport(state, &device, &mut transport, sysinfo).await;
+    poll_device_with_transport(state, &device, &mut transport, &sysinfo).await;
 
     Ok(())
 }
