@@ -3,7 +3,7 @@ use std::{io::IsTerminal, time::Duration};
 use clap::{Parser, Subcommand};
 use kasa_core::{
     Credentials, DEFAULT_PORT, broadcast, commands, discovery, send_command,
-    transport::{DeviceConfig, Transport, connect},
+    transport::{DeviceConfig, Transport, TransportExt, connect},
 };
 use tracing::{debug, error};
 
@@ -804,12 +804,28 @@ async fn resolve_child_id_with_transport(
             .map_err(|_| format!("Invalid plug number: {}", plug_arg))?;
 
         debug!("Resolving plug slot {} to child ID via transport", slot);
-        let response = transport
-            .send(commands::INFO)
+        let sysinfo = transport
+            .get_sysinfo()
             .await
             .map_err(|e| format!("Failed to get sysinfo: {}", e))?;
 
-        Ok(extract_child_id_from_response(&response, slot))
+        if sysinfo.children.is_empty() {
+            return Err(
+                "Device does not have child plugs. The --plug option is only for power strips."
+                    .to_string(),
+            );
+        }
+
+        if slot >= sysinfo.children.len() {
+            return Err(format!(
+                "Plug {} not found. Device has {} plugs (0-{})",
+                slot,
+                sysinfo.children.len(),
+                sysinfo.children.len() - 1
+            ));
+        }
+
+        Ok(sysinfo.children[slot].id.clone())
     } else {
         // It's a full child ID
         Ok(plug_arg.to_string())
