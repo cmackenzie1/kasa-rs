@@ -1,10 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "kasa-v*"
-      - "kasa-prometheus-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., kasa-v0.5.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,7 +29,14 @@ jobs:
       - name: Parse tag
         id: parse
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ inputs.tag }}"
+
+          # Verify tag exists
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag '$TAG' does not exist"
+            exit 1
+          fi
+
           # Extract crate name and version from tag (e.g., kasa-v0.5.1 -> kasa, 0.5.1)
           if [[ "$TAG" =~ ^(kasa-prometheus)-v(.+)$ ]]; then
             CRATE="${BASH_REMATCH[1]}"
@@ -36,7 +45,7 @@ jobs:
             CRATE="${BASH_REMATCH[1]}"
             VERSION="${BASH_REMATCH[2]}"
           else
-            echo "::error::Unable to parse tag: $TAG"
+            echo "::error::Tag must match 'kasa-v*' or 'kasa-prometheus-v*', got: $TAG"
             exit 1
           fi
 
@@ -47,7 +56,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
-          echo "Parsed: crate=$CRATE, version=$VERSION, prev_tag=$PREV_TAG"
+          echo "Releasing: crate=$CRATE, version=$VERSION, prev_tag=$PREV_TAG"
 
   build:
     needs: prepare
@@ -66,6 +75,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,9 +95,8 @@ jobs:
 
       - name: Rename binary
         run: |
-          BINARY="${{ needs.prepare.outputs.crate }}"
-          # Handle crate name to binary name (kasa-prometheus -> kasa-prometheus)
-          mv "target/${{ matrix.target }}/release/${BINARY}" "${{ needs.prepare.outputs.crate }}-${{ matrix.target }}"
+          mv "target/${{ matrix.target }}/release/${{ needs.prepare.outputs.crate }}" \
+             "${{ needs.prepare.outputs.crate }}-${{ matrix.target }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -112,10 +122,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.prepare.outputs.crate }}-v${{ needs.prepare.outputs.version }}"
+          TAG="${{ inputs.tag }}"
           PREV_TAG="${{ needs.prepare.outputs.prev_tag }}"
 
-          if [ -n "$PREV_TAG" ]; then
+          # Check if release already exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets..."
+            gh release upload "$TAG" artifacts/* --clobber
+          elif [ -n "$PREV_TAG" ]; then
             gh release create "$TAG" \
               --title "$TAG" \
               --generate-notes \
