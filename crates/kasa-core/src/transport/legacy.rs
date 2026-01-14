@@ -72,7 +72,7 @@ impl LegacyTransport {
     /// Sends a command using the legacy protocol.
     async fn send_command(&self, command: &str) -> Result<String, Error> {
         let addr = format!("{}:{}", self.host, self.port);
-        debug!("Connecting to {}", addr);
+        debug!(addr = %addr, "connecting");
 
         // Connect with timeout
         let mut stream = timeout(self.timeout, TcpStream::connect(&addr))
@@ -80,10 +80,10 @@ impl LegacyTransport {
             .map_err(|_| Error::Timeout("Connection timed out".into()))?
             .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
-        debug!("Connected to {}", addr);
+        debug!(addr = %addr, "connected");
 
         let encrypted = encrypt(command);
-        debug!("Sending {} bytes", encrypted.len());
+        debug!(bytes = encrypted.len(), "sending request");
 
         // Write with timeout
         timeout(self.timeout, stream.write_all(&encrypted))
@@ -99,7 +99,7 @@ impl LegacyTransport {
             .map_err(|e| Error::IoError(e.to_string()))?;
 
         let payload_len = u32::from_be_bytes(len_buf) as usize;
-        debug!("Response payload length: {} bytes", payload_len);
+        debug!(payload_bytes = payload_len, "response payload length");
 
         // Sanity check on payload length
         if payload_len > 1024 * 1024 {
@@ -116,7 +116,7 @@ impl LegacyTransport {
             .map_err(|_| Error::Timeout("Read timed out".into()))?
             .map_err(|e| Error::IoError(e.to_string()))?;
 
-        debug!("Received {} bytes", payload_len);
+        debug!(bytes = payload_len, "received response");
 
         let decrypted = decrypt(&payload);
         Ok(decrypted)

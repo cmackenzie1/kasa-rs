@@ -295,7 +295,7 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
     socket.set_broadcast(true)?;
 
     let encrypted = crypto::xor::encrypt_udp(commands::INFO);
-    debug!("Sending discovery broadcast to {}", BROADCAST_ADDR);
+    debug!(addr = BROADCAST_ADDR, "sending discovery broadcast");
     socket.send_to(&encrypted, BROADCAST_ADDR).await?;
 
     let mut devices = Vec::new();
@@ -312,9 +312,9 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
 
         match timeout(remaining, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, addr))) => {
-                debug!("Received {} bytes from {}", n, addr);
+                debug!(bytes = n, addr = %addr, "received discovery response");
                 let decrypted = decrypt(&buf[..n]);
-                debug!("Decrypted response: {}", decrypted);
+                debug!(response = %decrypted, "decrypted discovery response");
 
                 if let Ok(response) = serde_json::from_str::<response::SysInfoResponse>(&decrypted)
                 {
@@ -342,17 +342,17 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                 }
             }
             Ok(Err(e)) => {
-                debug!("Error receiving discovery response: {}", e);
+                debug!(error = %e, "error receiving discovery response");
                 break;
             }
             Err(_) => {
-                debug!("Discovery timeout reached");
+                debug!("discovery timeout reached");
                 break;
             }
         }
     }
 
-    debug!("Discovered {} devices", devices.len());
+    debug!(device_count = devices.len(), "discovery completed");
     Ok(devices)
 }
 
@@ -392,7 +392,7 @@ pub async fn broadcast(
     credentials: Option<Credentials>,
 ) -> std::io::Result<Vec<BroadcastResult>> {
     let devices = discovery::discover_all(discovery_timeout).await?;
-    debug!("Broadcasting command to {} devices", devices.len());
+    debug!(device_count = devices.len(), "broadcasting command");
 
     if devices.is_empty() {
         return Ok(Vec::new());

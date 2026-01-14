@@ -275,11 +275,12 @@ impl TpapTransport {
         // For simplicity, we use username/password directly
         // TODO: Support extra_crypt transformations (password_shadow, authkey, etc.)
         let credential_str = if self.credentials.username.is_empty() {
-            self.credentials.password.clone()
+            self.credentials.expose_password().to_string()
         } else {
             format!(
                 "{}/{}",
-                self.credentials.username, self.credentials.password
+                self.credentials.username,
+                self.credentials.expose_password()
             )
         };
 

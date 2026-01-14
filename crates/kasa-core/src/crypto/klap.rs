@@ -48,7 +48,7 @@ type Aes128CbcDec = Decryptor<Aes128>;
 /// ```
 pub fn generate_auth_hash(credentials: &Credentials) -> [u8; 16] {
     let username_hash = md5_hash(credentials.username.as_bytes());
-    let password_hash = md5_hash(credentials.password.as_bytes());
+    let password_hash = md5_hash(credentials.expose_password().as_bytes());
 
     let mut combined = Vec::with_capacity(32);
     combined.extend_from_slice(&username_hash);
@@ -64,7 +64,7 @@ pub fn generate_auth_hash(credentials: &Credentials) -> [u8; 16] {
 /// This is used by newer devices (KlapTransportV2).
 pub fn generate_auth_hash_v2(credentials: &Credentials) -> [u8; 32] {
     let username_hash = sha1_hash(credentials.username.as_bytes());
-    let password_hash = sha1_hash(credentials.password.as_bytes());
+    let password_hash = sha1_hash(credentials.expose_password().as_bytes());
 
     let mut combined = Vec::with_capacity(40);
     combined.extend_from_slice(&username_hash);
