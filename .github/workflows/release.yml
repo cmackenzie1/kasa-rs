@@ -123,7 +123,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag }}"
+          CRATE="${{ needs.prepare.outputs.crate }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
           PREV_TAG="${{ needs.prepare.outputs.prev_tag }}"
+
+          # Set descriptive title based on crate
+          case "$CRATE" in
+            kasa)
+              TITLE="Kasa CLI v${VERSION}"
+              ;;
+            kasa-prometheus)
+              TITLE="Kasa Prometheus Exporter v${VERSION}"
+              ;;
+            *)
+              TITLE="$TAG"
+              ;;
+          esac
 
           # Check if release already exists
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -131,13 +146,13 @@ jobs:
             gh release upload "$TAG" artifacts/* --clobber
           elif [ -n "$PREV_TAG" ]; then
             gh release create "$TAG" \
-              --title "$TAG" \
+              --title "$TITLE" \
               --generate-notes \
               --notes-start-tag "$PREV_TAG" \
               artifacts/*
           else
             gh release create "$TAG" \
-              --title "$TAG" \
+              --title "$TITLE" \
               --generate-notes \
               artifacts/*
           fi
