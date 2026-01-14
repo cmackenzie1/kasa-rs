@@ -91,10 +91,12 @@ async fn main() {
     // Initialize tracing
     if cli.verbose {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_max_level(tracing::Level::DEBUG)
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_max_level(tracing::Level::INFO)
             .init();
     }
@@ -102,22 +104,22 @@ async fn main() {
     // Create credentials from CLI args or environment
     let credentials = match (&cli.username, &cli.password) {
         (Some(user), Some(pass)) => {
-            info!("Using credentials for user: {}", user);
+            info!(user = %user, "using credentials");
             Some(Credentials::new(user, pass))
         }
         (Some(user), None) => {
             warn!(
-                "Username {} provided but no password. KLAP/TPAP devices may not be accessible.",
-                user
+                user = %user,
+                "username provided but no password - KLAP/TPAP devices may not be accessible"
             );
             None
         }
         (None, Some(_)) => {
-            warn!("Password provided but no username. Credentials will not be used.");
+            warn!("password provided but no username - credentials will not be used");
             None
         }
         (None, None) => {
-            info!("No credentials provided. Only legacy XOR devices will be fully accessible.");
+            info!("no credentials provided - only legacy XOR devices will be fully accessible");
             None
         }
     };
@@ -157,16 +159,16 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .with_state(state);
 
-    info!("Starting kasa-exporter on {}", cli.listen);
-    info!("Polling interval: {}s", cli.scrape_interval);
+    info!(listen_addr = %cli.listen, "starting kasa-exporter");
+    info!(
+        interval_secs = cli.scrape_interval,
+        "polling interval configured"
+    );
 
     if cli.targets.is_empty() {
-        info!("Mode: discovery (will find devices automatically)");
+        info!(mode = "discovery", "will find devices automatically");
     } else {
-        info!("Mode: targeted ({} devices)", cli.targets.len());
-        for target in &cli.targets {
-            info!("  - {}", target);
-        }
+        info!(mode = "targeted", target_count = cli.targets.len(), targets = ?cli.targets, "using targeted mode");
     }
 
     let listener = tokio::net::TcpListener::bind(cli.listen).await.unwrap();
@@ -186,7 +188,7 @@ async fn poll_devices(
 
     loop {
         ticker.tick().await;
-        debug!("Starting device poll cycle");
+        debug!("starting device poll cycle");
 
         let start = std::time::Instant::now();
 
@@ -194,7 +196,7 @@ async fn poll_devices(
             // Discovery mode - use discover_all to find both legacy and KLAP/TPAP devices
             match discovery::discover_all(discovery_timeout).await {
                 Ok(devices) => {
-                    info!("Discovered {} devices", devices.len());
+                    info!(device_count = devices.len(), "discovered devices");
                     state.metrics.set_devices_discovered(devices.len());
 
                     // Poll all devices concurrently
@@ -211,7 +213,7 @@ async fn poll_devices(
                     futures::future::join_all(futures).await;
                 }
                 Err(e) => {
-                    error!("Discovery failed: {}", e);
+                    error!(error = %e, "discovery failed");
                     state.metrics.set_devices_discovered(0);
                 }
             }
@@ -226,8 +228,8 @@ async fn poll_devices(
                     let target = target.clone();
                     async move {
                         match poll_targeted_device(&state, &target, command_timeout).await {
-                            Ok(()) => debug!("Successfully polled {}", target),
-                            Err(e) => warn!("Failed to poll {}: {}", target, e),
+                            Ok(()) => debug!(target = %target, "successfully polled device"),
+                            Err(e) => warn!(target = %target, error = %e, "failed to poll device"),
                         }
                     }
                 })
@@ -237,7 +239,7 @@ async fn poll_devices(
 
         let duration = start.elapsed();
         state.metrics.set_scrape_duration(duration);
-        debug!("Poll cycle completed in {:?}", duration);
+        debug!(duration_ms = duration.as_millis(), "poll cycle completed");
     }
 }
 
@@ -250,8 +252,11 @@ async fn poll_discovered_device(
     let ip = device.ip.to_string();
 
     debug!(
-        "Polling device {} ({}) at {} using {:?} protocol",
-        device.alias, device.model, ip, device.encryption_type
+        alias = %device.alias,
+        model = %device.model,
+        ip = %ip,
+        protocol = ?device.encryption_type,
+        "polling device"
     );
 
     // Build device config from discovery results
@@ -263,8 +268,9 @@ async fn poll_discovered_device(
             config = config.with_credentials(creds.clone());
         } else {
             debug!(
-                "Device {} uses {:?} but no credentials provided, trying anyway",
-                device.alias, device.encryption_type
+                alias = %device.alias,
+                protocol = ?device.encryption_type,
+                "device requires authentication but no credentials provided, trying anyway"
             );
         }
     }
@@ -273,10 +279,10 @@ async fn poll_discovered_device(
     match connect(config).await {
         Ok(mut transport) => {
             debug!(
-                "Connected to {} using {} on port {}",
-                device.alias,
-                transport.encryption_type(),
-                transport.port()
+                alias = %device.alias,
+                protocol = %transport.encryption_type(),
+                port = transport.port(),
+                "connected to device"
             );
 
             // Get sysinfo using TransportExt
@@ -286,8 +292,10 @@ async fn poll_discovered_device(
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to get sysinfo from {} ({}): {}",
-                        device.alias, ip, e
+                        alias = %device.alias,
+                        ip = %ip,
+                        error = %e,
+                        "failed to get sysinfo"
                     );
                     set_basic_device_metrics(state, device);
                 }
@@ -295,8 +303,11 @@ async fn poll_discovered_device(
         }
         Err(e) => {
             warn!(
-                "Failed to connect to {} ({}) using {:?}: {}",
-                device.alias, ip, device.encryption_type, e
+                alias = %device.alias,
+                ip = %ip,
+                protocol = ?device.encryption_type,
+                error = %e,
+                "failed to connect to device"
             );
             // Set basic metrics from discovery data even if we can't connect
             set_basic_device_metrics(state, device);
@@ -387,10 +398,10 @@ async fn poll_device_with_transport(
     // Check if this is a power strip with children
     if sysinfo.is_power_strip() {
         debug!(
-            "{} ({}) is a power strip with {} plugs",
-            updated_device.alias,
-            updated_device.model,
-            sysinfo.children.len()
+            alias = %updated_device.alias,
+            model = %updated_device.model,
+            plug_count = sysinfo.children.len(),
+            "power strip detected"
         );
 
         // Collect child IDs for batched energy query
@@ -401,8 +412,9 @@ async fn poll_device_with_transport(
             Ok(readings) => readings,
             Err(e) => {
                 debug!(
-                    "Failed to get batched energy data from {}: {}",
-                    updated_device.alias, e
+                    alias = %updated_device.alias,
+                    error = %e,
+                    "failed to get batched energy data"
                 );
                 Vec::new()
             }
@@ -440,8 +452,10 @@ async fn poll_device_with_transport(
             Err(e) => {
                 // Energy monitoring not supported is not a failure
                 debug!(
-                    "{} ({}) energy query failed: {}",
-                    updated_device.alias, updated_device.model, e
+                    alias = %updated_device.alias,
+                    model = %updated_device.model,
+                    error = %e,
+                    "energy query failed (may not be supported)"
                 );
                 state.metrics.set_scrape_success(&updated_device, true);
             }
@@ -457,8 +471,9 @@ async fn poll_device_with_transport(
         }
         Err(e) => {
             debug!(
-                "Failed to get cloud info from {}: {}",
-                updated_device.alias, e
+                alias = %updated_device.alias,
+                error = %e,
+                "failed to get cloud info"
             );
         }
     }
@@ -486,10 +501,10 @@ async fn poll_targeted_device(
     })?;
 
     debug!(
-        "Connected to {} using {} on port {}",
-        target,
-        transport.encryption_type(),
-        transport.port()
+        target = %target,
+        protocol = %transport.encryption_type(),
+        port = transport.port(),
+        "connected to targeted device"
     );
 
     // Get sysinfo using TransportExt

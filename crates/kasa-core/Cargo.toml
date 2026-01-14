@@ -47,3 +47,4 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-pki-types = "1.0"
 webpki-roots = "0.26"
 base64 = "0.22"
+secrecy = "0.10.3"

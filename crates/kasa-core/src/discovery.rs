@@ -242,13 +242,13 @@ pub async fn discover_all(discovery_timeout: Duration) -> std::io::Result<Vec<Di
     // Send legacy discovery (port 9999)
     let legacy_query = crate::crypto::xor::encrypt_udp(crate::commands::INFO);
     let legacy_addr = format!("{}:{}", BROADCAST_ADDR, LEGACY_DISCOVERY_PORT);
-    debug!("Sending legacy discovery to {}", legacy_addr);
+    debug!(addr = %legacy_addr, "sending legacy discovery");
     socket.send_to(&legacy_query, &legacy_addr).await?;
 
     // Send TDP discovery (port 20002)
     let (tdp_query, _private_key) = generate_tdp_discovery_query()?;
     let tdp_addr = format!("{}:{}", BROADCAST_ADDR, TDP_DISCOVERY_PORT);
-    debug!("Sending TDP discovery to {}", tdp_addr);
+    debug!(addr = %tdp_addr, "sending TDP discovery");
     socket.send_to(&tdp_query, &tdp_addr).await?;
 
     let mut devices = Vec::new();
@@ -260,7 +260,7 @@ pub async fn discover_all(discovery_timeout: Duration) -> std::io::Result<Vec<Di
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            debug!("Discovery timeout reached");
+            debug!("discovery timeout reached");
             break;
         }
 
@@ -274,7 +274,7 @@ pub async fn discover_all(discovery_timeout: Duration) -> std::io::Result<Vec<Di
                     continue;
                 }
 
-                debug!("Received {} bytes from {}:{}", n, ip, port);
+                debug!(bytes = n, ip = %ip, port, "received discovery response");
 
                 if port == LEGACY_DISCOVERY_PORT {
                     // Legacy XOR response
@@ -291,7 +291,7 @@ pub async fn discover_all(discovery_timeout: Duration) -> std::io::Result<Vec<Di
                 }
             }
             Ok(Err(e)) => {
-                debug!("Error receiving discovery response: {}", e);
+                debug!(error = %e, "error receiving discovery response");
                 break;
             }
             Err(_) => {
@@ -301,14 +301,14 @@ pub async fn discover_all(discovery_timeout: Duration) -> std::io::Result<Vec<Di
         }
     }
 
-    debug!("Discovered {} devices", devices.len());
+    debug!(device_count = devices.len(), "discovery completed");
     Ok(devices)
 }
 
 /// Parse a legacy (port 9999) discovery response.
 fn parse_legacy_response(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
     let decrypted = crate::crypto::xor::decrypt(data);
-    debug!("Legacy response from {}: {}", ip, decrypted);
+    debug!(ip = %ip, response = %decrypted, "legacy discovery response");
 
     #[derive(Deserialize)]
     struct SysInfoResponse {
@@ -383,7 +383,7 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
     let result = parse_tdp_response(data).ok()?;
 
     if result.error_code != 0 {
-        debug!("TDP response error_code: {}", result.error_code);
+        debug!(error_code = result.error_code, "TDP response has error");
         return None;
     }
 
@@ -401,8 +401,12 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
     let login_version = scheme.map(|s| s.lv).filter(|&v| v > 0);
 
     debug!(
-        "TDP device {} model={} type={} encrypt={:?} new_klap={:?}",
-        ip, info.device_model, info.device_type, encryption_type, new_klap
+        ip = %ip,
+        model = %info.device_model,
+        device_type = %info.device_type,
+        encryption_type = ?encryption_type,
+        new_klap = ?new_klap,
+        "TDP device discovered"
     );
 
     Some(DiscoveredDevice {

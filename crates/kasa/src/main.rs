@@ -376,6 +376,7 @@ async fn main() {
     // Initialize tracing
     if cli.verbose {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_max_level(tracing::Level::DEBUG)
             .init();
     }
@@ -388,12 +389,12 @@ async fn main() {
 
         Command::Discover { timeout } => match discovery::discover_all(timeout).await {
             Ok(devices) => {
-                debug!("Discovered {} devices", devices.len());
+                debug!(device_count = devices.len(), "discovered devices");
                 let json = serde_json::to_value(&devices).unwrap_or_default();
                 println!("{}", json);
             }
             Err(e) => {
-                error!("Discovery failed: {}", e);
+                error!(error = %e, "discovery failed");
                 eprintln!("Error: Discovery failed: {}", e);
                 std::process::exit(1);
             }
@@ -420,7 +421,7 @@ async fn main() {
             if legacy {
                 // Force legacy protocol - use send_command directly
                 let port = port.unwrap_or(DEFAULT_PORT);
-                debug!("Using legacy protocol on port {}", port);
+                debug!(port, protocol = "legacy", "using legacy protocol");
 
                 // Build command JSON (plug resolution uses legacy transport too)
                 let command_json =
@@ -429,7 +430,7 @@ async fn main() {
                 match send_command(&target, port, timeout, &command_json).await {
                     Ok(response) => print_json_response(&response),
                     Err(e) => {
-                        error!("Could not connect to host {}:{}: {}", target, port, e);
+                        error!(host = %target, port, error = %e, "could not connect to host");
                         eprintln!(
                             "Error: Could not connect to host {}:{}: {}",
                             target, port, e
@@ -447,13 +448,13 @@ async fn main() {
                     config = config.with_credentials(creds);
                 }
 
-                debug!("Connecting to {} with auto-detection", target);
+                debug!(host = %target, "connecting with auto-detection");
                 match connect(config).await {
                     Ok(transport) => {
                         debug!(
-                            "Connected using {} protocol on port {}",
-                            transport.encryption_type(),
-                            transport.port()
+                            protocol = %transport.encryption_type(),
+                            port = transport.port(),
+                            "connected"
                         );
 
                         // Handle energy command specially for power strips
@@ -461,7 +462,7 @@ async fn main() {
                             match handle_energy_command(transport.as_ref()).await {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    error!("Energy command failed: {}", e);
+                                    error!(error = %e, "energy command failed");
                                     eprintln!("Error: {}", e);
                                     std::process::exit(1);
                                 }
@@ -485,7 +486,7 @@ async fn main() {
                             match transport.send(&command_json).await {
                                 Ok(response) => print_json_response(&response),
                                 Err(e) => {
-                                    error!("Command failed: {}", e);
+                                    error!(error = %e, "command failed");
                                     eprintln!("Error: Command failed: {}", e);
                                     std::process::exit(1);
                                 }
@@ -493,7 +494,7 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        error!("Could not connect to {}: {}", target, e);
+                        error!(host = %target, error = %e, "could not connect");
                         eprintln!("Error: Could not connect to {}: {}", target, e);
                         eprintln!();
                         eprintln!("If your device has newer firmware (KLAP protocol), try:");
@@ -523,7 +524,7 @@ async fn main() {
             };
 
             let command_json = command.to_json();
-            debug!("Broadcasting command: {}", command_json);
+            debug!(command = %command_json, "broadcasting command");
 
             match broadcast(discovery_timeout, timeout, command_json, credentials).await {
                 Ok(results) => {
@@ -531,7 +532,7 @@ async fn main() {
                     println!("{}", json);
                 }
                 Err(e) => {
-                    error!("Broadcast failed: {}", e);
+                    error!(error = %e, "broadcast failed");
                     eprintln!("Error: Broadcast failed: {}", e);
                     std::process::exit(1);
                 }
@@ -545,12 +546,12 @@ async fn main() {
             command,
         } => match command {
             WifiCommand::Scan => {
-                debug!("Scanning for WiFi networks via {}", host);
+                debug!(host = %host, "scanning for WiFi networks");
 
                 // Try netif first
                 match send_command(&host, port, timeout, commands::WLANSCAN).await {
                     Ok(response) => {
-                        debug!("netif response: {}", response);
+                        debug!(response = %response, "netif response received");
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
                             let scaninfo = json.get("netif").and_then(|n| n.get("get_scaninfo"));
 
@@ -563,11 +564,11 @@ async fn main() {
                                     println!("{}", json);
                                     return;
                                 }
-                                debug!("scaninfo present but no ap_list, err_code: {:?}", err_code);
+                                debug!(err_code = ?err_code, "scaninfo present but no ap_list");
                             } else {
                                 debug!(
-                                    "no scaninfo in response, keys: {:?}",
-                                    json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                                    keys = ?json.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+                                    "no scaninfo in response"
                                 );
                             }
                         } else {
@@ -577,7 +578,7 @@ async fn main() {
                         debug!("netif scan failed, trying softaponboarding fallback");
                     }
                     Err(e) => {
-                        debug!("netif scan error: {}, trying softaponboarding fallback", e);
+                        debug!(error = %e, "netif scan error, trying softaponboarding fallback");
                     }
                 }
 
@@ -606,7 +607,7 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        error!("Could not connect to host {}:{}: {}", host, port, e);
+                        error!(host = %host, port, error = %e, "could not connect to host");
                         eprintln!("Error: Could not connect to host {}:{}: {}", host, port, e);
                         eprintln!();
                         eprintln!("Make sure you are connected to the device's WiFi AP");
@@ -631,7 +632,7 @@ async fn main() {
                     }
                 };
 
-                debug!("Joining WiFi network '{}' with key_type {}", ssid, keytype);
+                debug!(ssid = %ssid, key_type = keytype, "joining WiFi network");
 
                 // Try netif first
                 let cmd = commands::wifi_join(&ssid, &pass, keytype);
@@ -655,7 +656,7 @@ async fn main() {
                         debug!("netif join failed, trying softaponboarding fallback");
                     }
                     Err(e) => {
-                        debug!("netif join error: {}, trying softaponboarding fallback", e);
+                        debug!(error = %e, "netif join error, trying softaponboarding fallback");
                     }
                 }
 
@@ -688,7 +689,7 @@ async fn main() {
                         print_wifi_join_success(&ssid);
                     }
                     Err(e) => {
-                        error!("Could not connect to host {}:{}: {}", host, port, e);
+                        error!(host = %host, port, error = %e, "could not connect to host");
                         eprintln!("Error: Could not connect to host {}:{}: {}", host, port, e);
                         eprintln!();
                         eprintln!("Make sure you are connected to the device's WiFi AP");
@@ -796,10 +797,7 @@ async fn resolve_child_id_legacy(
             std::process::exit(1);
         });
 
-        debug!(
-            "Resolving plug slot {} to child ID via legacy transport",
-            slot
-        );
+        debug!(slot, "resolving plug slot to child ID via legacy transport");
         match send_command(target, port, timeout, commands::INFO).await {
             Ok(response) => extract_child_id_from_response(&response, slot),
             Err(e) => {
@@ -824,7 +822,7 @@ async fn resolve_child_id_with_transport(
             .parse()
             .map_err(|_| format!("Invalid plug number: {}", plug_arg))?;
 
-        debug!("Resolving plug slot {} to child ID via transport", slot);
+        debug!(slot, "resolving plug slot to child ID via transport");
         let sysinfo = transport
             .get_sysinfo()
             .await

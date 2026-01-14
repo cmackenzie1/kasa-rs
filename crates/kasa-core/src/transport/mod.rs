@@ -176,29 +176,41 @@ impl DeviceConfig {
 pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> {
     // If we have an encryption hint from discovery, try that protocol first
     if let Some(hint) = config.encryption_hint {
-        tracing::debug!("Using encryption hint: {}", hint);
+        tracing::debug!(encryption_hint = %hint, "using encryption hint");
         match hint {
             EncryptionType::Xor => {
                 if let Ok(transport) = try_legacy(&config).await {
                     return Ok(Box::new(transport));
                 }
-                tracing::debug!("Hinted XOR protocol failed, trying other protocols");
+                tracing::debug!(
+                    protocol = "XOR",
+                    "hinted protocol failed, trying other protocols"
+                );
             }
             EncryptionType::Klap => {
                 if let Ok(transport) = try_klap(&config).await {
                     return Ok(Box::new(transport));
                 }
-                tracing::debug!("Hinted KLAP protocol failed, trying other protocols");
+                tracing::debug!(
+                    protocol = "KLAP",
+                    "hinted protocol failed, trying other protocols"
+                );
             }
             EncryptionType::Tpap => {
                 if let Ok(transport) = try_tpap(&config).await {
                     return Ok(Box::new(transport));
                 }
-                tracing::debug!("Hinted TPAP protocol failed, trying other protocols");
+                tracing::debug!(
+                    protocol = "TPAP",
+                    "hinted protocol failed, trying other protocols"
+                );
             }
             EncryptionType::Aes => {
                 // AES (Tapo) not yet implemented, fall through to auto-detection
-                tracing::debug!("AES protocol not yet supported, trying other protocols");
+                tracing::debug!(
+                    protocol = "AES",
+                    "protocol not yet supported, trying other protocols"
+                );
             }
         }
     }
@@ -209,7 +221,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         match try_tpap(&config).await {
             Ok(transport) => return Ok(Box::new(transport)),
             Err(e) => {
-                tracing::debug!("TPAP connection failed: {}, trying KLAP", e);
+                tracing::debug!(error = %e, "TPAP connection failed, trying KLAP");
             }
         }
 
@@ -217,7 +229,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         match try_klap(&config).await {
             Ok(transport) => return Ok(Box::new(transport)),
             Err(e) => {
-                tracing::debug!("KLAP connection failed: {}, trying legacy", e);
+                tracing::debug!(error = %e, "KLAP connection failed, trying legacy");
             }
         }
     }
@@ -226,7 +238,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
     match try_legacy(&config).await {
         Ok(transport) => return Ok(Box::new(transport)),
         Err(e) => {
-            tracing::debug!("Legacy connection failed: {}", e);
+            tracing::debug!(error = %e, "legacy connection failed");
         }
     }
 
@@ -593,7 +605,7 @@ impl<T: Transport + ?Sized + Send + Sync> TransportExt for T {
             match self.get_energy_for_child(child_id).await {
                 Ok(reading) => readings.push(reading),
                 Err(e) => {
-                    tracing::debug!("Failed to get energy for child {}: {}", child_id, e);
+                    tracing::debug!(child_id, error = %e, "failed to get energy for child");
                     // Push a default/empty reading to maintain index alignment
                     readings.push(crate::response::EnergyReading::default());
                 }
@@ -620,7 +632,7 @@ impl<T: Transport + ?Sized + Send + Sync> TransportExt for T {
                 let energy = match self.get_energy_for_child(&child.id).await {
                     Ok(reading) => reading,
                     Err(e) => {
-                        tracing::debug!("Failed to get energy for child {}: {}", child.id, e);
+                        tracing::debug!(child_id = %child.id, error = %e, "failed to get energy for child");
                         crate::response::EnergyReading::default()
                     }
                 };

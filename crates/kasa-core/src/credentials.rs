@@ -12,13 +12,26 @@
 //!
 //! The KLAP handshake will try the user's credentials first, then fall back to
 //! these defaults if authentication fails.
+//!
+//! # Security
+//!
+//! Passwords are stored using [`SecretString`] from the `secrecy` crate to prevent
+//! accidental logging or display. Use [`Credentials::expose_password()`] to access
+//! the raw password value when needed for authentication.
 
 use std::fmt;
+
+use secrecy::{ExposeSecret, SecretString};
 
 /// Credentials for authenticating with TP-Link devices.
 ///
 /// Used by the KLAP protocol for devices with newer firmware.
 /// Legacy devices (using the XOR protocol on port 9999) do not require credentials.
+///
+/// # Security
+///
+/// The password is stored as a [`SecretString`] to prevent accidental logging.
+/// Use [`expose_password()`](Self::expose_password) to access the raw password.
 ///
 /// # Example
 ///
@@ -30,13 +43,16 @@ use std::fmt;
 ///
 /// // Create blank credentials (for devices never connected to cloud)
 /// let blank = Credentials::blank();
+///
+/// // Access the password when needed for authentication
+/// let password = creds.expose_password();
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Credentials {
     /// The username (typically an email address for TP-Link cloud accounts).
     pub username: String,
-    /// The password for the account.
-    pub password: String,
+    /// The password for the account (protected from accidental logging).
+    password: SecretString,
 }
 
 impl Credentials {
@@ -58,7 +74,7 @@ impl Credentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             username: username.into(),
-            password: password.into(),
+            password: SecretString::from(password.into()),
         }
     }
 
@@ -76,7 +92,10 @@ impl Credentials {
     /// assert!(blank.is_blank());
     /// ```
     pub fn blank() -> Self {
-        Self::default()
+        Self {
+            username: String::new(),
+            password: SecretString::from(String::new()),
+        }
     }
 
     /// Returns `true` if both username and password are empty.
@@ -90,13 +109,40 @@ impl Credentials {
     /// assert!(!Credentials::new("user", "pass").is_blank());
     /// ```
     pub fn is_blank(&self) -> bool {
-        self.username.is_empty() && self.password.is_empty()
+        self.username.is_empty() && self.password.expose_secret().is_empty()
+    }
+
+    /// Exposes the password for authentication purposes.
+    ///
+    /// # Security
+    ///
+    /// Only use this method when the password is actually needed for
+    /// authentication. Never log or display the returned value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kasa_core::Credentials;
+    ///
+    /// let creds = Credentials::new("user", "secret");
+    /// let password = creds.expose_password();
+    /// assert_eq!(password, "secret");
+    /// ```
+    pub fn expose_password(&self) -> &str {
+        self.password.expose_secret()
+    }
+}
+
+impl Default for Credentials {
+    fn default() -> Self {
+        Self::blank()
     }
 }
 
 impl PartialEq for Credentials {
     fn eq(&self, other: &Self) -> bool {
-        self.username == other.username && self.password == other.password
+        self.username == other.username
+            && self.password.expose_secret() == other.password.expose_secret()
     }
 }
 
@@ -152,7 +198,7 @@ mod tests {
     fn test_credentials_new() {
         let creds = Credentials::new("user@example.com", "password123");
         assert_eq!(creds.username, "user@example.com");
-        assert_eq!(creds.password, "password123");
+        assert_eq!(creds.expose_password(), "password123");
     }
 
     #[test]
@@ -160,7 +206,7 @@ mod tests {
         let blank = Credentials::blank();
         assert!(blank.is_blank());
         assert_eq!(blank.username, "");
-        assert_eq!(blank.password, "");
+        assert_eq!(blank.expose_password(), "");
     }
 
     #[test]
@@ -194,11 +240,11 @@ mod tests {
     fn test_default_credentials() {
         let kasa = DefaultCredentials::Kasa.credentials();
         assert_eq!(kasa.username, "kasa@tp-link.net");
-        assert_eq!(kasa.password, "kasaSetup");
+        assert_eq!(kasa.expose_password(), "kasaSetup");
 
         let tapo = DefaultCredentials::Tapo.credentials();
         assert_eq!(tapo.username, "test@tp-link.net");
-        assert_eq!(tapo.password, "test");
+        assert_eq!(tapo.expose_password(), "test");
     }
 
     #[test]

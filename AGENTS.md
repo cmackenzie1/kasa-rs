@@ -160,6 +160,34 @@ timeout(command_timeout, stream.write_all(&encrypted))
 - Output JSON for machine-readable commands
 - Use `--verbose` / `-v` flag for debug logging
 
+### Tracing and Logging
+
+Use structured fields with key=value syntax for all tracing macros:
+
+```rust
+// Good - structured fields
+debug!(host = %target, port, protocol = "legacy", "connecting to device");
+error!(error = %e, device_id = %id, "failed to send command");
+info!(device_count = devices.len(), "discovery completed");
+
+// Bad - format string interpolation
+debug!("Connecting to {} on port {}", target, port);
+error!("Failed to send command: {}", e);
+```
+
+Field formatting:
+- Use `%` for Display formatting: `host = %addr`
+- Use `?` for Debug formatting: `encryption_type = ?enc`
+- Use bare field names when variable matches: `port` instead of `port = port`
+- Message strings should be lowercase for consistency
+
+### Sensitive Data Handling
+
+- Use the `secrecy` crate for sensitive data like passwords
+- Wrap passwords in `SecretString` to prevent accidental logging
+- Access secret values only via `.expose_secret()` method
+- Never log credentials, even at debug level
+
 ### Testing
 
 - Unit tests go in `#[cfg(test)] mod tests` at bottom of file
