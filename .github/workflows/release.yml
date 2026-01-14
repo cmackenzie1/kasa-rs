@@ -1,17 +1,10 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      level:
-        description: "Release level (patch, minor, major)"
-        required: true
-        default: "patch"
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    tags:
+      - "kasa-v*"
+      - "kasa-prometheus-v*"
 
 permissions:
   contents: write
@@ -20,42 +13,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  prepare:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.release.outputs.version }}
-      sha: ${{ steps.release.outputs.sha }}
+      crate: ${{ steps.parse.outputs.crate }}
+      version: ${{ steps.parse.outputs.version }}
+      prev_tag: ${{ steps.parse.outputs.prev_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-binstall
-        run: curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-
-      - name: Install cargo-release
-        run: cargo binstall --no-confirm cargo-release
-
-      - name: Configure git
+      - name: Parse tag
+        id: parse
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Extract crate name and version from tag (e.g., kasa-v0.5.1 -> kasa, 0.5.1)
+          if [[ "$TAG" =~ ^(kasa-prometheus)-v(.+)$ ]]; then
+            CRATE="${BASH_REMATCH[1]}"
+            VERSION="${BASH_REMATCH[2]}"
+          elif [[ "$TAG" =~ ^(kasa)-v(.+)$ ]]; then
+            CRATE="${BASH_REMATCH[1]}"
+            VERSION="${BASH_REMATCH[2]}"
+          else
+            echo "::error::Unable to parse tag: $TAG"
+            exit 1
+          fi
 
-      - name: Run cargo release
-        id: release
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo release ${{ inputs.level }} --workspace --execute --no-confirm
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "kasa") | .version')
+          # Find previous tag for this crate
+          PREV_TAG=$(git tag -l "${CRATE}-v*" --sort=-v:refname | grep -v "^${TAG}$" | head -n1 || echo "")
+
+          echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Parsed: crate=$CRATE, version=$VERSION, prev_tag=$PREV_TAG"
 
   build:
-    needs: release
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -70,10 +65,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release.outputs.sha }}
-          fetch-depth: 0
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -88,24 +80,26 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p kasa
+        run: cargo build --release --target ${{ matrix.target }} -p ${{ needs.prepare.outputs.crate }}
 
       - name: Rename binary
-        run: mv target/${{ matrix.target }}/release/kasa kasa-${{ matrix.target }}
+        run: |
+          BINARY="${{ needs.prepare.outputs.crate }}"
+          # Handle crate name to binary name (kasa-prometheus -> kasa-prometheus)
+          mv "target/${{ matrix.target }}/release/${BINARY}" "${{ needs.prepare.outputs.crate }}-${{ matrix.target }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kasa-${{ matrix.target }}
-          path: kasa-${{ matrix.target }}
+          name: ${{ needs.prepare.outputs.crate }}-${{ matrix.target }}
+          path: ${{ needs.prepare.outputs.crate }}-${{ matrix.target }}
 
   publish:
-    needs: [release, build]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.release.outputs.sha }}
           fetch-depth: 0
 
       - name: Download artifacts
@@ -114,26 +108,22 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Get previous tag
-        id: prev_tag
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 v${{ needs.release.outputs.version }}^ 2>/dev/null || echo "")
-          echo "tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          NOTES_START_TAG="${{ steps.prev_tag.outputs.tag }}"
-          if [ -n "$NOTES_START_TAG" ]; then
-            gh release create v${{ needs.release.outputs.version }} \
-              --title "v${{ needs.release.outputs.version }}" \
+          TAG="${{ needs.prepare.outputs.crate }}-v${{ needs.prepare.outputs.version }}"
+          PREV_TAG="${{ needs.prepare.outputs.prev_tag }}"
+
+          if [ -n "$PREV_TAG" ]; then
+            gh release create "$TAG" \
+              --title "$TAG" \
               --generate-notes \
-              --notes-start-tag "$NOTES_START_TAG" \
+              --notes-start-tag "$PREV_TAG" \
               artifacts/*
           else
-            gh release create v${{ needs.release.outputs.version }} \
-              --title "v${{ needs.release.outputs.version }}" \
+            gh release create "$TAG" \
+              --title "$TAG" \
               --generate-notes \
               artifacts/*
           fi
