@@ -29,6 +29,7 @@ pub async fn handle_discover(timeout: Duration) {
 }
 
 /// Handle the device command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_device(
     target: String,
     port: Option<u16>,
