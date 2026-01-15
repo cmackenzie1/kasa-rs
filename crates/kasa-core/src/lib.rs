@@ -45,7 +45,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = DeviceConfig::new("192.168.1.100")
 //!         .with_credentials(Credentials::new("user@example.com", "password"));
-//!     
+//!
 //!     let transport = connect(config).await?;
 //!     let response = transport.send(r#"{"system":{"get_sysinfo":{}}}"#).await?;
 //!     println!("{}", response);
@@ -72,13 +72,13 @@
 //!     // Connect to multiple devices
 //!     let device1 = connect(DeviceConfig::new("192.168.1.100")).await?;
 //!     let device2 = connect(DeviceConfig::new("192.168.1.101")).await?;
-//!     
+//!
 //!     // Query both devices concurrently (safe - different devices)
 //!     let (info1, info2) = tokio::join!(
 //!         device1.get_sysinfo(),
 //!         device2.get_sysinfo(),
 //!     );
-//!     
+//!
 //!     println!("Device 1: {}", info1?.alias);
 //!     println!("Device 2: {}", info2?.alias);
 //!     Ok(())
