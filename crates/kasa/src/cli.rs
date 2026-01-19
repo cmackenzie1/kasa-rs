@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use kasa_core::{DEFAULT_PORT, commands};
+use kasa_core::commands;
 
 pub fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
     let seconds = arg.parse()?;
@@ -95,13 +95,18 @@ pub enum Command {
         #[arg(long, default_value = "192.168.0.1")]
         host: String,
 
-        /// Target port
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Target port (default: auto-detect based on protocol, or 9999 for legacy)
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Timeout in seconds
         #[arg(long, value_parser = parse_duration, default_value = "10")]
         timeout: Duration,
+
+        /// Force legacy protocol (XOR on port 9999).
+        /// Use this to skip KLAP protocol detection.
+        #[arg(long)]
+        legacy: bool,
 
         #[command(subcommand)]
         command: WifiCommand,

@@ -69,9 +69,19 @@ async fn main() {
             host,
             port,
             timeout,
+            legacy,
             command,
         } => {
-            handle_wifi(host, port, timeout, command).await;
+            handle_wifi(
+                host,
+                port,
+                timeout,
+                legacy,
+                command,
+                cli.username,
+                cli.password_stdin,
+            )
+            .await;
         }
     }
 }
