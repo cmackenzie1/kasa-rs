@@ -220,6 +220,11 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
     }
 
     // Auto-detect protocol: try authenticated protocols first if credentials provided
+    let has_real_credentials = config
+        .credentials
+        .as_ref()
+        .is_some_and(|c| !c.is_blank());
+
     if config.credentials.is_some() {
         // Try TPAP first (newer firmware on port 4433)
         match try_tpap(&config).await {
@@ -233,12 +238,24 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         match try_klap(&config).await {
             Ok(transport) => return Ok(box_klap(transport)),
             Err(e) => {
-                tracing::debug!(error = %e, "KLAP connection failed, trying legacy");
+                tracing::debug!(error = %e, "KLAP connection failed");
             }
         }
     }
 
-    // Try legacy XOR protocol
+    // Do NOT silently downgrade to unauthenticated legacy XOR when real
+    // credentials were supplied: an attacker who blocks KLAP/TPAP could force
+    // control commands (and WiFi secrets) onto the cleartext protocol.
+    if has_real_credentials {
+        return Err(Error::AuthenticationFailed(format!(
+            "Could not connect to {} using an authenticated protocol (TPAP/KLAP). \
+             Refusing to fall back to the unauthenticated legacy protocol because \
+             credentials were provided. Use --legacy explicitly to override.",
+            config.host
+        )));
+    }
+
+    // Try legacy XOR protocol (only when no real credentials were provided)
     match try_legacy(&config).await {
         Ok(transport) => return Ok(Box::new(transport)),
         Err(e) => {

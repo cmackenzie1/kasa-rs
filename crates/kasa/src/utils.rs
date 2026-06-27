@@ -232,6 +232,13 @@ fn extract_child_id_from_response(response: &str, slot: usize) -> String {
                 .and_then(|c| c.as_array());
 
             match children {
+                Some(children) if children.is_empty() => {
+                    eprintln!(
+                        "Error: Device does not have child plugs. \
+                            The --plug option is only for power strips."
+                    );
+                    std::process::exit(1);
+                }
                 Some(children) => {
                     if slot >= children.len() {
                         eprintln!(

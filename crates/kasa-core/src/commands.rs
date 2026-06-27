@@ -113,10 +113,12 @@ pub const WLANSCAN_SOFTAP: &str =
 /// The password is sent in plaintext within the JSON command, though it is
 /// encrypted using the TP-Link protocol before transmission over the network.
 pub fn cloud_bind(username: &str, password: &str) -> String {
-    format!(
-        r#"{{"cnCloud":{{"bind":{{"username":"{}","password":"{}"}}}}}}"#,
-        username, password
-    )
+    // Build via serde_json so that usernames/passwords containing `"` or `\`
+    // are escaped rather than breaking out of the JSON string (injection).
+    serde_json::json!({
+        "cnCloud": { "bind": { "username": username, "password": password } }
+    })
+    .to_string()
 }
 
 /// Generate a command to connect the device to a WiFi network.
@@ -139,10 +141,12 @@ pub fn cloud_bind(username: &str, password: &str) -> String {
 /// assert!(cmd.contains("key_type"));
 /// ```
 pub fn wifi_join(ssid: &str, password: &str, key_type: u8) -> String {
-    format!(
-        r#"{{"netif":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
-        ssid, password, key_type
-    )
+    serde_json::json!({
+        "netif": {
+            "set_stainfo": { "ssid": ssid, "password": password, "key_type": key_type }
+        }
+    })
+    .to_string()
 }
 
 /// Generate a command to connect the device to a WiFi network (alternative endpoint).
@@ -156,10 +160,12 @@ pub fn wifi_join(ssid: &str, password: &str, key_type: u8) -> String {
 /// * `password` - Network password
 /// * `key_type` - Security type: 0=none, 1=WEP, 2=WPA, 3=WPA2
 pub fn wifi_join_softap(ssid: &str, password: &str, key_type: u8) -> String {
-    format!(
-        r#"{{"smartlife.iot.common.softaponboarding":{{"set_stainfo":{{"ssid":"{}","password":"{}","key_type":{}}}}}}}"#,
-        ssid, password, key_type
-    )
+    serde_json::json!({
+        "smartlife.iot.common.softaponboarding": {
+            "set_stainfo": { "ssid": ssid, "password": password, "key_type": key_type }
+        }
+    })
+    .to_string()
 }
 
 /// Wrap a command with context for a specific child plug.
@@ -187,10 +193,17 @@ pub fn wifi_join_softap(ssid: &str, password: &str, key_type: u8) -> String {
 /// assert!(cmd.contains("child_ids"));
 /// ```
 pub fn with_child_context(child_id: &str, command_inner: &str) -> String {
-    format!(
-        r#"{{"context":{{"child_ids":["{}"]}},{}}}"#,
-        child_id, command_inner
-    )
+    // `child_id` may originate from a device response, so escape it via serde
+    // rather than interpolating it raw into the JSON string. `command_inner` is
+    // an internal, crate-controlled fragment and is spliced as-is.
+    let child_ids = serde_json::json!({ "context": { "child_ids": [child_id] } });
+    let context_str = child_ids.to_string();
+    // context_str looks like `{"context":{"child_ids":["..."]}}`; splice the
+    // inner command in before the closing brace.
+    let trimmed = context_str
+        .strip_suffix('}')
+        .expect("serialized object ends with }");
+    format!("{},{}}}", trimmed, command_inner)
 }
 
 /// Generate an energy reading command for a specific child plug.
@@ -254,13 +267,10 @@ pub fn relay_off_for_child(child_id: &str) -> String {
 /// ```
 #[doc(hidden)]
 pub fn energy_for_children(child_ids: &[impl AsRef<str>]) -> String {
-    let ids_json: Vec<String> = child_ids
-        .iter()
-        .map(|id| format!(r#""{}""#, id.as_ref()))
-        .collect();
-
-    format!(
-        r#"{{"context":{{"child_ids":[{}]}},"emeter":{{"get_realtime":{{}}}}}}"#,
-        ids_json.join(",")
-    )
+    let ids: Vec<&str> = child_ids.iter().map(|id| id.as_ref()).collect();
+    serde_json::json!({
+        "context": { "child_ids": ids },
+        "emeter": { "get_realtime": {} }
+    })
+    .to_string()
 }
