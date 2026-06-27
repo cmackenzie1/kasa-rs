@@ -78,7 +78,8 @@ struct Cli {
 
     /// TP-Link cloud account password.
     /// Required for devices with newer firmware (KLAP/TPAP protocols).
-    /// Can also be set via KASA_PASSWORD environment variable.
+    /// Prefer the KASA_PASSWORD environment variable: a password passed as a CLI
+    /// flag is visible to other users via `ps` and `/proc/<pid>/cmdline`.
     #[arg(short, long, env = "KASA_PASSWORD")]
     password: Option<String>,
 }

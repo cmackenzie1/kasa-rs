@@ -59,6 +59,10 @@ pub const DEFAULT_HTTPS_PORT: u16 = 4433;
 /// Session cookie name used by KLAP.
 const SESSION_COOKIE_NAME: &str = "TP_SESSIONID";
 
+/// Maximum size of an HTTP response we will buffer from a device. Bounds memory
+/// use against a rogue/buggy device that streams an unbounded body.
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
 /// Authentication hash for KLAP protocol.
 ///
 /// KLAP v1 uses MD5-based hashing, while v2 uses SHA256-based hashing.
@@ -167,12 +171,9 @@ impl KlapTransport {
         let (remote_seed, server_hash, session_cookie) =
             Self::perform_handshake1(host, port, &local_seed, timeout).await?;
 
-        debug!(
-            local_seed = %hex::encode(local_seed),
-            remote_seed = %hex::encode(remote_seed),
-            server_hash = %hex::encode(server_hash),
-            "Handshake1 completed, trying auth hash combinations"
-        );
+        // Do not log seeds or the server hash: together with a known username
+        // they form an offline password-guessing transcript.
+        debug!("Handshake1 completed, trying auth hash combinations");
 
         // Build list of credential sets to try
         let mut credential_sets: Vec<(&str, Credentials)> = vec![("user", credentials.clone())];
@@ -265,11 +266,7 @@ impl KlapTransport {
             }
         }
 
-        // Log all attempted hashes for debugging
-        debug!(
-            server_hash = %hex::encode(server_hash),
-            "No auth hash combination matched server response"
-        );
+        debug!("No auth hash combination matched server response");
 
         Err(Error::AuthenticationFailed(
             "KLAP authentication failed: device response did not match any credential combination. \
@@ -407,6 +404,12 @@ impl KlapTransport {
 
             response.extend_from_slice(&buf[..n]);
 
+            if response.len() > MAX_RESPONSE_SIZE {
+                return Err(Error::Protocol(format!(
+                    "Response too large: exceeded {MAX_RESPONSE_SIZE} bytes"
+                )));
+            }
+
             // Check if we have the complete headers
             if let Some(header_end) = find_header_end(&response) {
                 // Parse headers to find Content-Length
@@ -418,6 +421,14 @@ impl KlapTransport {
                 let _body_received = response.len() - body_start;
 
                 if let Some(expected_len) = content_length {
+                    // Reject an absurd Content-Length up front instead of looping
+                    // toward it.
+                    if expected_len > MAX_RESPONSE_SIZE {
+                        return Err(Error::Protocol(format!(
+                            "Response Content-Length {expected_len} exceeds maximum {MAX_RESPONSE_SIZE}"
+                        )));
+                    }
+
                     // Read remaining body if needed
                     while response.len() - body_start < expected_len {
                         let n = timeout(io_timeout, stream.read(&mut buf))
@@ -462,12 +473,7 @@ impl KlapTransport {
         local_seed: &[u8; 16],
         io_timeout: Duration,
     ) -> Result<([u8; 16], [u8; 32], String), Error> {
-        debug!(
-            host,
-            port,
-            local_seed = %hex::encode(local_seed),
-            "Performing KLAP handshake1"
-        );
+        debug!(host, port, "Performing KLAP handshake1");
 
         let (status, body, cookie) =
             Self::http_post(host, port, "/app/handshake1", local_seed, None, io_timeout).await?;
@@ -498,9 +504,9 @@ impl KlapTransport {
 
         let session_cookie = cookie.unwrap_or_default();
 
+        // Avoid logging the remote seed and session cookie (session material).
         debug!(
-            remote_seed = %hex::encode(remote_seed),
-            cookie = %if session_cookie.is_empty() { "<none>" } else { &session_cookie },
+            has_cookie = !session_cookie.is_empty(),
             "Handshake1 received response"
         );
 

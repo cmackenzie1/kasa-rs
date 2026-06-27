@@ -268,8 +268,21 @@ impl KlapEncryptionSession {
             return Err(DecryptError::PayloadTooShort);
         }
 
-        let _signature = &ciphertext[..32];
+        let received_sig = &ciphertext[..32];
         let encrypted = &ciphertext[32..];
+
+        // Verify the response signature before decrypting: this SHA-256 tag is
+        // KLAP's only integrity protection (AES-CBC, no AEAD), so without it a
+        // MITM can tamper with the (malleable) ciphertext undetected.
+        let mut sig_data = Vec::with_capacity(28 + 4 + encrypted.len());
+        sig_data.extend_from_slice(&self.sig);
+        sig_data.extend_from_slice(&seq.to_be_bytes());
+        sig_data.extend_from_slice(encrypted);
+        let expected_sig = sha256_hash(&sig_data);
+
+        if received_sig != expected_sig.as_slice() {
+            return Err(DecryptError::SignatureInvalid);
+        }
 
         let iv = self.build_iv(seq);
 
