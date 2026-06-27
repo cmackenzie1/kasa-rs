@@ -20,3 +20,9 @@ futures = { workspace = true }
 prometheus-client = "0.24.0"
 axum = "0.8.8"
 serde_json = { workspace = true }
+
+[features]
+# Forward kasa-core crypto backend (aws-lc-rs default / ring).
+default = ["aws-lc-rs"]
+aws-lc-rs = ["kasa-core/aws-lc-rs"]
+ring = ["kasa-core/ring"]

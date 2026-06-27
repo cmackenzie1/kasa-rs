@@ -41,10 +41,16 @@ chacha20poly1305 = "0.10"
 hex-literal = "0.4"
 # End RustCrypto
 
-# TLS support for TPAP
-tokio-rustls = "0.26"
+# TLS for TPAP. Crypto provider feature-selectable (aws-lc-rs default / ring).
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pki-types = "1.0"
 webpki-roots = "0.26"
 base64 = "0.22"
 secrecy = "0.10.3"
+
+[features]
+# Crypto backend: aws-lc-rs (rustls default) or ring.
+default = ["aws-lc-rs"]
+aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
+ring = ["rustls/ring", "tokio-rustls/ring"]
