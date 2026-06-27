@@ -555,8 +555,17 @@ fn create_tls_config() -> Result<rustls::ClientConfig, Error> {
         }
     }
 
-    // Build config with TLS 1.2 only (TPAP devices don't support TLS 1.3)
-    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+    // Pick crypto provider explicitly per feature — avoids relying on a
+    // process-installed default.
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    let provider = rustls::crypto::ring::default_provider();
+    #[cfg(feature = "aws-lc-rs")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+
+    // TLS 1.2 only — TPAP devices don't support 1.3.
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .map_err(|e| Error::Protocol(format!("TLS provider/version setup failed: {}", e)))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
         .with_no_client_auth();
