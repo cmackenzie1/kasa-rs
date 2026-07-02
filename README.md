@@ -209,6 +209,7 @@ The following devices have been tested, but others using the same protocol shoul
 - [HS103](https://www.kasasmart.com/us/products/smart-plugs/kasa-smart-plug-lite-hs103) - Smart Wi-Fi Plug Lite
 - [HS110](https://www.kasasmart.com/us/products/smart-plugs/kasa-smart-plug-energy-monitoring-hs110) - Smart Wi-Fi Plug with Energy Monitoring
 - [KP115](https://www.kasasmart.com/us/products/smart-plugs/kasa-smart-plug-slim-energy-monitoring-kp115) - Smart Wi-Fi Plug Slim with Energy Monitoring
+- [KP125M](https://www.kasasmart.com/us/products/smart-plugs/kasa-smart-plug-slim-energy-monitoring-kp125m) - Smart Wi-Fi Plug Slim with Energy Monitoring and Matter (SMART protocol, requires credentials)
 
 ## Examples
 

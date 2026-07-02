@@ -16,6 +16,13 @@
 //! over HTTP port 80. This requires TP-Link cloud credentials. Use the
 //! [`transport`] module for KLAP support.
 //!
+//! ## SMART Protocol
+//!
+//! SMART-family devices (e.g., KP125M) use KLAP for transport but speak a
+//! different command protocol (`{"method":"get_device_info"}` style). These
+//! are detected automatically during connection and legacy commands are
+//! translated transparently - see [`transport::SmartTransport`].
+//!
 //! # Quick Start
 //!
 //! For legacy devices (no credentials needed):
@@ -335,6 +342,7 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                         hw_ver: info.hw_ver,
                         sw_ver: info.sw_ver,
                         encryption_type: EncryptionType::Xor, // Legacy discovery
+                        device_type: None,
                         http_port: None,
                         new_klap: None,
                         login_version: None,

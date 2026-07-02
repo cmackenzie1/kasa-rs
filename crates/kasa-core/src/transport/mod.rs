@@ -5,15 +5,19 @@
 //!
 //! - [`LegacyTransport`]: XOR-encrypted TCP on port 9999 (older firmware)
 //! - [`KlapTransport`]: HTTP with AES encryption on port 80 (newer firmware)
+//! - [`SmartTransport`]: SMART protocol adapter over KLAP for SMART-family
+//!   devices (e.g., KP125M)
 //!
 //! Use [`connect`] to automatically detect and connect using the appropriate protocol.
 
 pub mod klap;
 pub mod legacy;
+pub mod smart;
 pub mod tpap;
 
 pub use klap::KlapTransport;
 pub use legacy::LegacyTransport;
+pub use smart::SmartTransport;
 pub use tpap::TpapTransport;
 
 use std::time::Duration;
@@ -189,7 +193,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
             }
             EncryptionType::Klap => {
                 if let Ok(transport) = try_klap(&config).await {
-                    return Ok(Box::new(transport));
+                    return Ok(box_klap(transport));
                 }
                 tracing::debug!(
                     protocol = "KLAP",
@@ -227,7 +231,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
 
         // Try KLAP (port 80)
         match try_klap(&config).await {
-            Ok(transport) => return Ok(Box::new(transport)),
+            Ok(transport) => return Ok(box_klap(transport)),
             Err(e) => {
                 tracing::debug!(error = %e, "KLAP connection failed, trying legacy");
             }
@@ -248,7 +252,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         let mut klap_config = config.clone();
         klap_config.credentials = Some(Credentials::blank());
         if let Ok(transport) = try_klap(&klap_config).await {
-            return Ok(Box::new(transport));
+            return Ok(box_klap(transport));
         }
     }
 
@@ -256,6 +260,20 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
         "Could not connect to {} using any protocol",
         config.host
     )))
+}
+
+/// Boxes a KLAP transport, wrapping it in the SMART protocol adapter when the
+/// handshake identified a SMART-family device (e.g., KP125M).
+fn box_klap(transport: KlapTransport) -> Box<dyn Transport> {
+    if transport.is_smart() {
+        tracing::debug!(
+            host = transport.host(),
+            "device uses SMART protocol, enabling command translation"
+        );
+        Box::new(SmartTransport::new(transport))
+    } else {
+        Box::new(transport)
+    }
 }
 
 async fn try_tpap(config: &DeviceConfig) -> Result<TpapTransport, Error> {

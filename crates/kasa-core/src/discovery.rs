@@ -68,6 +68,10 @@ pub struct DiscoveredDevice {
     pub updating: bool,
     /// Encryption type used by the device.
     pub encryption_type: EncryptionType,
+    /// Device type reported by TDP discovery (e.g., "IOT.SMARTPLUGSWITCH",
+    /// "SMART.KASAPLUG"). `None` for devices found via legacy discovery.
+    #[serde(default)]
+    pub device_type: Option<String>,
     /// HTTP port for KLAP devices.
     pub http_port: Option<u16>,
     /// Whether device uses new KLAP (v2).
@@ -84,13 +88,22 @@ pub struct TdpDiscoveryResult {
 }
 
 /// Device info from TDP discovery.
+///
+/// All fields are optional in practice - different firmware versions include
+/// different subsets (e.g., KP125M firmware 1.2.5 omits `hw_ver`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TdpDeviceInfo {
+    #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
     pub device_type: String,
+    #[serde(default)]
     pub device_model: String,
+    #[serde(default)]
     pub ip: String,
+    #[serde(default)]
     pub mac: String,
+    #[serde(default)]
     pub hw_ver: String,
     #[serde(default)]
     pub owner: String,
@@ -372,6 +385,7 @@ fn parse_legacy_response(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
         on_time: info.on_time,
         updating: info.updating == 1,
         encryption_type: EncryptionType::Xor,
+        device_type: None,
         http_port: None,
         new_klap: None,
         login_version: None,
@@ -380,7 +394,13 @@ fn parse_legacy_response(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
 
 /// Parse a TDP (port 20002) discovery response.
 fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
-    let result = parse_tdp_response(data).ok()?;
+    let result = match parse_tdp_response(data) {
+        Ok(result) => result,
+        Err(e) => {
+            debug!(ip = %ip, error = %e, "failed to parse TDP response");
+            return None;
+        }
+    };
 
     if result.error_code != 0 {
         debug!(error_code = result.error_code, "TDP response has error");
@@ -424,6 +444,7 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
         on_time: 0,            // Unknown from TDP
         updating: false,       // Unknown from TDP
         encryption_type,
+        device_type: Some(info.device_type),
         http_port,
         new_klap,
         login_version,
