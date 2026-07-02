@@ -60,8 +60,14 @@ struct Cli {
     command_timeout: u64,
 
     /// Target specific device IP addresses instead of using discovery.
-    /// Can be specified multiple times.
-    #[arg(long = "target", value_name = "IP")]
+    /// Can be specified multiple times or set as a comma-separated
+    /// KASA_TARGETS environment variable.
+    #[arg(
+        long = "target",
+        value_name = "IP",
+        env = "KASA_TARGETS",
+        value_delimiter = ','
+    )]
     targets: Vec<String>,
 
     /// TP-Link cloud account username (email).
@@ -84,6 +90,20 @@ struct AppState {
     credentials: Option<Credentials>,
 }
 
+fn normalize_targets(targets: Vec<String>) -> Vec<String> {
+    targets
+        .into_iter()
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())
+        .collect()
+}
+
+fn normalize_optional_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -101,8 +121,12 @@ async fn main() {
             .init();
     }
 
+    let targets = normalize_targets(cli.targets.clone());
+    let username = normalize_optional_value(cli.username.clone());
+    let password = normalize_optional_value(cli.password.clone());
+
     // Create credentials from CLI args or environment
-    let credentials = match (&cli.username, &cli.password) {
+    let credentials = match (&username, &password) {
         (Some(user), Some(pass)) => {
             info!(user = %user, "using credentials");
             Some(Credentials::new(user, pass))
@@ -139,7 +163,7 @@ async fn main() {
     let scrape_interval = Duration::from_secs(cli.scrape_interval);
     let discovery_timeout = Duration::from_secs(cli.discovery_timeout);
     let command_timeout = Duration::from_secs(cli.command_timeout);
-    let targets = cli.targets.clone();
+    let poll_targets = targets.clone();
 
     tokio::spawn(async move {
         poll_devices(
@@ -147,7 +171,7 @@ async fn main() {
             scrape_interval,
             discovery_timeout,
             command_timeout,
-            targets,
+            poll_targets,
         )
         .await;
     });
@@ -165,10 +189,10 @@ async fn main() {
         "polling interval configured"
     );
 
-    if cli.targets.is_empty() {
+    if targets.is_empty() {
         info!(mode = "discovery", "will find devices automatically");
     } else {
-        info!(mode = "targeted", target_count = cli.targets.len(), targets = ?cli.targets, "using targeted mode");
+        info!(mode = "targeted", target_count = targets.len(), targets = ?targets, "using targeted mode");
     }
 
     let listener = tokio::net::TcpListener::bind(cli.listen).await.unwrap();
@@ -628,5 +652,33 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
             [("content-type", "text/plain; charset=utf-8")],
             format!("Error encoding metrics: {}", e),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_optional_value, normalize_targets};
+
+    #[test]
+    fn test_normalize_targets_filters_empty_values() {
+        let targets = normalize_targets(vec![
+            String::new(),
+            "  ".to_string(),
+            "192.168.1.10".to_string(),
+            " 192.168.1.11 ".to_string(),
+        ]);
+
+        assert_eq!(targets, vec!["192.168.1.10", "192.168.1.11"]);
+    }
+
+    #[test]
+    fn test_normalize_optional_value_filters_empty_values() {
+        assert_eq!(normalize_optional_value(None), None);
+        assert_eq!(normalize_optional_value(Some(String::new())), None);
+        assert_eq!(normalize_optional_value(Some("  ".to_string())), None);
+        assert_eq!(
+            normalize_optional_value(Some(" user@example.com ".to_string())),
+            Some("user@example.com".to_string())
+        );
     }
 }
