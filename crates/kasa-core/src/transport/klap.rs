@@ -74,7 +74,7 @@ enum AuthHash {
 ///
 /// v1: `sha256(local_seed + auth_hash)` - used by older devices and IOT devices
 /// v2: `sha256(local_seed + remote_seed + auth_hash)` - used by SMART devices
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HandshakeVersion {
     V1,
     V2,
@@ -123,6 +123,7 @@ pub struct KlapTransport {
     session: Arc<Mutex<KlapEncryptionSession>>,
     session_cookie: String,
     timeout: Duration,
+    handshake_version: HandshakeVersion,
 }
 
 impl KlapTransport {
@@ -328,7 +329,18 @@ impl KlapTransport {
             session: Arc::new(Mutex::new(session)),
             session_cookie: session_cookie.to_string(),
             timeout: io_timeout,
+            handshake_version,
         })
+    }
+
+    /// Returns true if the device negotiated the KLAP v2 handshake.
+    ///
+    /// The v2 handshake is only used by SMART-protocol devices (e.g., KP125M,
+    /// Tapo devices), which expect `{"method":...}` style commands instead of
+    /// the legacy `{"system":{"get_sysinfo":{}}}` style. IOT devices with KLAP
+    /// firmware use the v1 handshake even when they use the v2 auth hash.
+    pub fn is_smart(&self) -> bool {
+        self.handshake_version == HandshakeVersion::V2
     }
 
     /// Sends a raw HTTP POST request and returns the response.
