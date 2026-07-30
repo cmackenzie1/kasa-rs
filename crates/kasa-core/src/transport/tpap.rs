@@ -42,6 +42,10 @@ use crate::{
 /// Default HTTPS port for TPAP protocol.
 pub const DEFAULT_PORT: u16 = 4433;
 
+/// Maximum size of an HTTP response we will buffer from a device. Bounds memory
+/// use against a rogue/buggy device that streams an unbounded body.
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
 /// TPAP discovery information from device.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TpapInfo {
@@ -245,15 +249,30 @@ impl TpapTransport {
                 .ok_or_else(|| Error::Protocol("Missing dev_share".into()))?,
         )?;
 
-        let iterations = result
+        // Reject iterations that would truncate when narrowed to u32 (2^32 would
+        // wrap to 0, collapsing PBKDF2 stretching), and reject 0 explicitly.
+        let iterations_u64 = result
             .get("iterations")
             .and_then(|v| v.as_u64())
-            .unwrap_or(10000) as u32;
+            .unwrap_or(10000);
+        if iterations_u64 == 0 || iterations_u64 > u32::MAX as u64 {
+            return Err(Error::Protocol(format!(
+                "Invalid PBKDF2 iterations from device: {iterations_u64}"
+            )));
+        }
+        let iterations = iterations_u64 as u32;
 
-        let cipher_suite = result
+        // Validate cipher suite fits in u8 before narrowing (avoids 257 -> 1 wrap).
+        let cipher_suite_u64 = result
             .get("cipher_suites")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u8;
+            .unwrap_or(1);
+        if cipher_suite_u64 > u8::MAX as u64 {
+            return Err(Error::Protocol(format!(
+                "Invalid cipher suite from device: {cipher_suite_u64}"
+            )));
+        }
+        let cipher_suite = cipher_suite_u64 as u8;
 
         let encryption = result
             .get("encryption")
@@ -284,13 +303,12 @@ impl TpapTransport {
             )
         };
 
-        // Create SPAKE2+ prover
-        let mut dev_random_arr = [0u8; 32];
-        if dev_random.len() >= 32 {
-            dev_random_arr.copy_from_slice(&dev_random[..32]);
-        } else {
-            dev_random_arr[..dev_random.len()].copy_from_slice(&dev_random);
-        }
+        // dev_random must be exactly 32 bytes; truncating/zero-padding a
+        // malformed value weakens transcript freshness, so reject it instead.
+        let dev_random_arr: [u8; 32] = dev_random.as_slice().try_into().map_err(|_| {
+            let len = dev_random.len();
+            Error::Protocol(format!("Invalid dev_random length: {len} (expected 32)"))
+        })?;
 
         let prover = Spake2PlusProver::new(
             credential_str.as_bytes(),
@@ -345,16 +363,10 @@ impl TpapTransport {
 
         let dev_confirm_bytes = base64_decode(dev_confirm)?;
 
-        // Compare confirmations (case-insensitive hex comparison for some implementations)
         if dev_confirm_bytes != expected_dev_confirm {
-            // Try hex string comparison
-            let expected_hex = hex::encode(&expected_dev_confirm).to_lowercase();
-            let received_hex = hex::encode(&dev_confirm_bytes).to_lowercase();
-            if expected_hex != received_hex {
-                return Err(Error::AuthenticationFailed(
-                    "SPAKE2+ confirmation mismatch".into(),
-                ));
-            }
+            return Err(Error::AuthenticationFailed(
+                "SPAKE2+ confirmation mismatch".into(),
+            ));
         }
 
         // Extract session info
@@ -365,10 +377,16 @@ impl TpapTransport {
             .ok_or_else(|| Error::Protocol("Missing session ID".into()))?
             .to_string();
 
-        let start_seq = share_result
+        let start_seq_u64 = share_result
             .get("start_seq")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+            .unwrap_or(1);
+        if start_seq_u64 > u32::MAX as u64 {
+            return Err(Error::Protocol(format!(
+                "Invalid start_seq from device: {start_seq_u64}"
+            )));
+        }
+        let start_seq = start_seq_u64 as u32;
 
         // Create session cipher
         let use_sha512 = matches!(
@@ -645,10 +663,22 @@ fn send_https_request_binary(
             Err(e) => return Err(Error::IoError(format!("Read failed: {}", e))),
         }
 
+        // Bound memory against a rogue device that streams an unbounded body.
+        if response.len() > MAX_RESPONSE_SIZE {
+            return Err(Error::Protocol(format!(
+                "Response too large: exceeded {MAX_RESPONSE_SIZE} bytes"
+            )));
+        }
+
         // Check if we have complete response (simple check for Content-Length)
         if let Some(header_end) = find_header_end(&response) {
             let headers = String::from_utf8_lossy(&response[..header_end]);
             if let Some(content_length) = parse_content_length(&headers) {
+                if content_length > MAX_RESPONSE_SIZE {
+                    return Err(Error::Protocol(format!(
+                        "Response Content-Length {content_length} exceeds maximum {MAX_RESPONSE_SIZE}"
+                    )));
+                }
                 let body_start = header_end + 4;
                 if response.len() >= body_start + content_length {
                     break;
