@@ -346,6 +346,7 @@ pub async fn discover(discovery_timeout: Duration) -> std::io::Result<Vec<Discov
                         http_port: None,
                         new_klap: None,
                         login_version: None,
+                        tpap: None,
                     });
                 }
             }
