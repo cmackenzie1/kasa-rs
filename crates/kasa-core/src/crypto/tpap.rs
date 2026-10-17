@@ -330,6 +330,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_aes_ccm_known_answer() {
+        // Independently calculated with Python cryptography HKDF and AESCCM.
+        let cipher =
+            TpapSessionCipher::from_shared_key(TpapCipherType::Aes128Ccm, &[0x42; 32], false);
+        let expected = hex::decode("abbc054120f949c204aaae3601077d1560d4daa10fdffd8028db036e60ae3361aaa7b9dc2c7f213857052b24").unwrap();
+        assert_eq!(
+            cipher
+                .encrypt(br#"{"method":"get_device_info"}"#, 7)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            cipher.decrypt(&expected, 7).unwrap(),
+            br#"{"method":"get_device_info"}"#
+        );
+    }
+
+    #[test]
     fn test_cipher_type_parse() {
         assert_eq!(
             TpapCipherType::parse("aes_128_ccm"),

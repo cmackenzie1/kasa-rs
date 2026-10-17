@@ -340,25 +340,11 @@ fn derive_w0_w1(password: &[u8], salt: &[u8], iterations: u32) -> (Scalar, Scala
 
 /// Convert wide bytes to a scalar (reduced mod order).
 fn bytes_to_scalar_wide(bytes: &[u8]) -> Scalar {
-    // Convert to big integer and reduce mod order
-    // P-256 order is: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
-    use p256::U256;
-    use p256::elliptic_curve::ops::Reduce;
-
-    // Hash down to 32 bytes if input is longer
-    let hash = if bytes.len() > 32 {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hasher.finalize().to_vec()
-    } else {
-        let mut padded = vec![0u8; 32];
-        let start = 32 - bytes.len();
-        padded[start..].copy_from_slice(bytes);
-        padded
-    };
-
-    let wide = U256::from_be_slice(&hash);
-    Scalar::reduce(wide)
+    // Scalar arithmetic reduces modulo the group order. Preserve every byte of
+    // the PBKDF2 output; hashing it produces a different password verifier.
+    bytes.iter().fold(Scalar::ZERO, |value, &byte| {
+        value * Scalar::from(256u64) + Scalar::from(u64::from(byte))
+    })
 }
 
 /// Generate a random scalar.
@@ -397,15 +383,15 @@ fn point_to_uncompressed(point: &ProjectivePoint) -> Vec<u8> {
     affine.to_encoded_point(false).as_bytes().to_vec()
 }
 
-/// Convert scalar to minimal big-endian bytes (as per RFC 9383).
+/// Encode a scalar using TPAP's big-endian transcript convention.
 fn scalar_to_minimal_bytes(scalar: &Scalar) -> Vec<u8> {
     let bytes = scalar.to_bytes();
     // Find first non-zero byte
     let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(31);
     let minimal = &bytes[first_nonzero..];
 
-    // If leading bit is set, prepend 0x00
-    if !minimal.is_empty() && (minimal[0] & 0x80) != 0 {
+    // TPAP adds a sign byte only when the unsigned encoding has odd length.
+    if minimal.len() % 2 == 1 && (minimal[0] & 0x80) != 0 {
         let mut result = vec![0x00];
         result.extend_from_slice(minimal);
         result
@@ -508,6 +494,66 @@ fn cmac_aes(key: &[u8], data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wide_scalar_reduces_modulo_order() {
+        // The P-256 order is zero modulo itself, including leading zero bytes.
+        let order = hex_literal::hex!(
+            "0000000000000000ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+        );
+        assert_eq!(bytes_to_scalar_wide(&order), Scalar::ZERO);
+    }
+
+    #[test]
+    fn test_tpap_scalar_encoding_even_length_high_bit() {
+        assert_eq!(
+            scalar_to_minimal_bytes(&Scalar::from(0x8000u64)),
+            vec![0x80, 0]
+        );
+        assert_eq!(
+            scalar_to_minimal_bytes(&Scalar::from(0x80u64)),
+            vec![0, 0x80]
+        );
+    }
+
+    #[test]
+    fn test_tpap_spake2plus_known_answer() {
+        // Independently calculated with Python integer curve arithmetic,
+        // hashlib PBKDF2/HMAC, and cryptography HKDF (TPAP suite 1).
+        let (w0, h) = derive_w0_w1(b"test_password", b"test_salt", 1000);
+        assert_eq!(
+            hex::encode(w0.to_bytes()),
+            "484f91d05fb7999ef5c77486a19c975eff51e1cb84acfd748d8f369fd9109512"
+        );
+        let x = Scalar::from(0x123456u64);
+        let prover = Spake2PlusProver {
+            w0,
+            h,
+            x,
+            share_p: ProjectivePoint::mul_by_generator(&x) + decode_point(&P256_M_COMPRESSED) * w0,
+            user_random: [0x11; 32],
+            dev_random: [0x22; 32],
+            suite: Spake2PlusCipherSuite::P256Sha256HmacSha256,
+        };
+        let dev_share = hex::decode("040687678d0527f892715286a71e0fb789e4ea7e48b1db38cc1cc454a88a48e2291b3e155312d00030b03fd329371307328668809a17341a86eb8c15154172a9b2").unwrap();
+        let (user_confirm, dev_confirm, shared_key) = prover.process_share(&dev_share).unwrap();
+        assert_eq!(
+            hex::encode(prover.share()),
+            "04c682853c89401aac37b56028bc32bf58c990cd3d73e63c116287f5513b06adc05ed6f28453fba7dcaf29d2c866fa747e23fd8f752ea4d470e4ba1fb86cfc49e2"
+        );
+        assert_eq!(
+            hex::encode(user_confirm),
+            "b994298e0e998d0cd42e5ac45a02041d49d83e3baf524530b1ca6f333f7442cd"
+        );
+        assert_eq!(
+            hex::encode(dev_confirm),
+            "7fb9ba49c2de296073f4faa129fb82bc8e60d0da999b643d625b1c6ca62bc0f0"
+        );
+        assert_eq!(
+            hex::encode(shared_key),
+            "0d3a92dbfe879b6eacc0e16fa0bbb64b620b30f46fbd670111dc40e333a023e6"
+        );
+    }
 
     #[test]
     fn test_decode_m_point() {
