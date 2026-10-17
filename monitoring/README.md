@@ -88,6 +88,11 @@ kasa-exporter:
   command: ["--listen", "0.0.0.0:9101"]
 ```
 
+KP125M firmware 1.4.1 uses TPAP over HTTP port 80. The exporter recognizes the
+advertised port and TLS mode automatically and uses the same account credentials.
+UDP discovery succeeding does not guarantee energy polling succeeds; check
+`kasa_scrape_success` and exporter logs as well as Prometheus target health.
+
 ### Prometheus
 
 Configuration: `monitoring/prometheus/prometheus.yml`
