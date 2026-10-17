@@ -18,10 +18,17 @@
 //!
 //! ## SMART Protocol
 //!
-//! SMART-family devices (e.g., KP125M) use KLAP for transport but speak a
+//! SMART-family devices (e.g., KP125M) use KLAP or TPAP for transport but speak a
 //! different command protocol (`{"method":"get_device_info"}` style). These
 //! are detected automatically during connection and legacy commands are
 //! translated transparently - see [`transport::SmartTransport`].
+//!
+//! ## TPAP Protocol
+//!
+//! Newer firmware (including KP125M 1.4.1) uses SPAKE2+ authentication and
+//! encrypted TPAP messages over HTTP port 80 or HTTPS port 4433. Discovery
+//! supplies the port and TLS mode. Use [`transport::connect`] with TP-Link
+//! credentials; SMART commands are translated transparently.
 //!
 //! # Quick Start
 //!
