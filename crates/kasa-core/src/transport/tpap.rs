@@ -1,7 +1,8 @@
 //! TPAP transport for TP-Link devices with SPAKE2+ authentication.
 //!
 //! TPAP (TP-Link Adaptive Protocol) is used by newer firmware versions that
-//! require stronger authentication. It operates over HTTPS on port 4433 and
+//! require stronger authentication. It operates over HTTP on port 80 or HTTPS
+//! on port 4433 and
 //! uses SPAKE2+ for password-authenticated key exchange.
 //!
 //! # Protocol Overview
@@ -13,7 +14,8 @@
 //!
 //! # TLS Requirements
 //!
-//! TPAP devices require TLS 1.2 with specific cipher suites. TLS 1.3 is NOT supported.
+//! Devices advertising TLS use TLS 1.2. Devices advertising `tls: 0` use HTTP,
+//! with application data protected by the authenticated TPAP session cipher.
 //! The device may require mutual TLS (client certificate) for TLS mode 2.
 
 use std::io::{Read, Write};
@@ -25,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rand::RngCore;
 use rustls::pki_types::ServerName;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::debug;
 
@@ -47,7 +49,7 @@ pub const DEFAULT_PORT: u16 = 4433;
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 /// TPAP discovery information from device.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TpapInfo {
     /// TLS mode: 0=none, 1=server-only, 2=mutual
     #[serde(default)]
@@ -88,7 +90,7 @@ struct TpapSession {
     cipher: TpapSessionCipher,
 }
 
-/// Transport using the TPAP protocol over HTTPS.
+/// Transport using the TPAP protocol over HTTP or HTTPS.
 pub struct TpapTransport {
     host: String,
     port: u16,
@@ -97,6 +99,7 @@ pub struct TpapTransport {
     tpap_info: Option<TpapInfo>,
     session: Option<TpapSession>,
     tls_config: Arc<rustls::ClientConfig>,
+    https: bool,
 }
 
 impl TpapTransport {
@@ -117,7 +120,30 @@ impl TpapTransport {
         credentials: Credentials,
         timeout: Duration,
     ) -> Result<Self, Error> {
-        debug!(host, port, "Attempting TPAP connection");
+        Self::connect_with_https(host, port, credentials, timeout, true).await
+    }
+
+    /// Connect using the HTTP or HTTPS mode advertised by TPAP discovery.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - Device IP address
+    /// * `port` - Advertised TPAP port
+    /// * `credentials` - TP-Link account credentials
+    /// * `timeout` - Connection and I/O timeout
+    /// * `https` - Whether the initial discovery request uses TLS
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if discovery, authentication, or network I/O fails.
+    pub async fn connect_with_https(
+        host: &str,
+        port: u16,
+        credentials: Credentials,
+        timeout: Duration,
+        https: bool,
+    ) -> Result<Self, Error> {
+        debug!(host, port, https, "attempting TPAP connection");
 
         // Create TLS config (insecure for now - devices use self-signed certs)
         let tls_config = create_tls_config()?;
@@ -130,6 +156,7 @@ impl TpapTransport {
             tpap_info: None,
             session: None,
             tls_config: Arc::new(tls_config),
+            https,
         };
 
         // Perform discovery
@@ -170,7 +197,13 @@ impl TpapTransport {
         if let Some(result) = response.get("result")
             && let Some(tpap) = result.get("tpap")
         {
-            self.tpap_info = serde_json::from_value(tpap.clone()).ok();
+            let info: TpapInfo = serde_json::from_value(tpap.clone())
+                .map_err(|e| Error::Protocol(format!("Invalid TPAP settings: {e}")))?;
+            self.https = info.tls != 0;
+            if info.port != 0 {
+                self.port = info.port;
+            }
+            self.tpap_info = Some(info);
         }
 
         debug!(tpap_info = ?self.tpap_info, "Discovery completed");
@@ -290,18 +323,8 @@ impl TpapTransport {
 
         let cipher_type = TpapCipherType::parse(encryption).unwrap_or(TpapCipherType::Aes128Ccm);
 
-        // Build credentials string
-        // For simplicity, we use username/password directly
-        // TODO: Support extra_crypt transformations (password_shadow, authkey, etc.)
-        let credential_str = if self.credentials.username.is_empty() {
-            self.credentials.expose_password().to_string()
-        } else {
-            format!(
-                "{}/{}",
-                self.credentials.username,
-                self.credentials.expose_password()
-            )
-        };
+        // Apply the password transformation negotiated by the device.
+        let credential_str = resolve_credentials(&self.credentials, result)?;
 
         // dev_random must be exactly 32 bytes; truncating/zero-padding a
         // malformed value weakens transcript freshness, so reject it instead.
@@ -413,11 +436,20 @@ impl TpapTransport {
         let host = self.host.clone();
         let port = self.port;
         let tls_config = self.tls_config.clone();
+        let https = self.https;
         let timeout = self.timeout;
         let body = body.to_string();
 
         tokio::task::spawn_blocking(move || {
-            send_https_request(&host, port, "/", &body, None, tls_config, timeout)
+            send_http_request(
+                &host,
+                port,
+                "/",
+                &body,
+                None,
+                https.then_some(tls_config),
+                timeout,
+            )
         })
         .await
         .map_err(|e| Error::IoError(format!("Task join error: {}", e)))?
@@ -434,10 +466,12 @@ impl TpapTransport {
         let seq = session.seq.fetch_add(1, Ordering::SeqCst);
 
         // Encrypt command
-        let encrypted = session
+        let ciphertext = session
             .cipher
             .encrypt(command.as_bytes(), seq)
             .map_err(|e| Error::Protocol(format!("Encryption failed: {}", e)))?;
+        let mut encrypted = seq.to_be_bytes().to_vec();
+        encrypted.extend_from_slice(&ciphertext);
 
         // Build path with session ID and sequence
         let path = format!("/stok={}/ds", session.session_id);
@@ -445,19 +479,37 @@ impl TpapTransport {
         let host = self.host.clone();
         let port = self.port;
         let tls_config = self.tls_config.clone();
+        let https = self.https;
         let timeout = self.timeout;
 
         // Send encrypted request
         let response = tokio::task::spawn_blocking(move || {
-            send_https_request_binary(&host, port, &path, &encrypted, tls_config, timeout)
+            send_http_request_binary(
+                &host,
+                port,
+                &path,
+                &encrypted,
+                https.then_some(tls_config),
+                timeout,
+            )
         })
         .await
         .map_err(|e| Error::IoError(format!("Task join error: {}", e)))??;
 
-        // Decrypt response
+        // Each encrypted frame carries its nonce sequence before the AEAD data.
+        if response.len() < 4 + 16 {
+            return Err(Error::Protocol("TPAP response is too short".into()));
+        }
+        let response_seq = u32::from_be_bytes(response[..4].try_into().unwrap());
+        if response_seq != seq {
+            debug!(
+                request_seq = seq,
+                response_seq, "device returned a different response sequence"
+            );
+        }
         let decrypted = session
             .cipher
-            .decrypt(&response, seq)
+            .decrypt(&response[4..], response_seq)
             .map_err(|e| Error::Protocol(format!("Decryption failed: {}", e)))?;
 
         String::from_utf8(decrypted)
@@ -573,29 +625,29 @@ fn create_tls_config() -> Result<rustls::ClientConfig, Error> {
     Ok(config)
 }
 
-/// Send an HTTPS POST request with JSON body.
-fn send_https_request(
+/// Send an HTTP or HTTPS POST request with JSON body.
+fn send_http_request(
     host: &str,
     port: u16,
     path: &str,
     body: &str,
     _cookie: Option<&str>,
-    tls_config: Arc<rustls::ClientConfig>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
     timeout: Duration,
 ) -> Result<String, Error> {
     let response =
-        send_https_request_binary(host, port, path, body.as_bytes(), tls_config, timeout)?;
+        send_http_request_binary(host, port, path, body.as_bytes(), tls_config, timeout)?;
     String::from_utf8(response)
         .map_err(|e| Error::Protocol(format!("Response is not valid UTF-8: {}", e)))
 }
 
-/// Send an HTTPS POST request with binary body.
-fn send_https_request_binary(
+/// Send an HTTP or HTTPS POST request with binary body.
+fn send_http_request_binary(
     host: &str,
     port: u16,
     path: &str,
     body: &[u8],
-    tls_config: Arc<rustls::ClientConfig>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
     timeout: Duration,
 ) -> Result<Vec<u8>, Error> {
     // Connect TCP
@@ -615,15 +667,25 @@ fn send_https_request_binary(
         .set_write_timeout(Some(timeout))
         .map_err(|e| Error::IoError(format!("Set write timeout failed: {}", e)))?;
 
-    // Create TLS connection
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| Error::ConnectionFailed("Invalid server name".into()))?;
+    if let Some(tls_config) = tls_config {
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|_| Error::ConnectionFailed("Invalid server name".into()))?;
+        let mut conn = rustls::ClientConnection::new(tls_config, server_name)
+            .map_err(|e| Error::ConnectionFailed(format!("TLS connection failed: {}", e)))?;
+        let mut stream = rustls::Stream::new(&mut conn, &mut tcp_stream);
+        exchange_http(&mut stream, host, port, path, body)
+    } else {
+        exchange_http(&mut tcp_stream, host, port, path, body)
+    }
+}
 
-    let mut conn = rustls::ClientConnection::new(tls_config, server_name)
-        .map_err(|e| Error::ConnectionFailed(format!("TLS connection failed: {}", e)))?;
-
-    let mut tls_stream = rustls::Stream::new(&mut conn, &mut tcp_stream);
-
+fn exchange_http(
+    stream: &mut (impl Read + Write),
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, Error> {
     // Build HTTP request with title-case headers
     let request = format!(
         "POST {} HTTP/1.1\r\n\
@@ -640,13 +702,13 @@ fn send_https_request_binary(
     );
 
     // Send request
-    tls_stream
+    stream
         .write_all(request.as_bytes())
         .map_err(|e| Error::IoError(format!("Write headers failed: {}", e)))?;
-    tls_stream
+    stream
         .write_all(body)
         .map_err(|e| Error::IoError(format!("Write body failed: {}", e)))?;
-    tls_stream
+    stream
         .flush()
         .map_err(|e| Error::IoError(format!("Flush failed: {}", e)))?;
 
@@ -655,7 +717,7 @@ fn send_https_request_binary(
     let mut buf = [0u8; 4096];
 
     loop {
-        match tls_stream.read(&mut buf) {
+        match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -730,6 +792,28 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 // Utility functions
 // =============================================================================
 
+fn resolve_credentials(credentials: &Credentials, result: &Value) -> Result<String, Error> {
+    if let Some(extra) = result.get("extra_crypt")
+        && let Some(kind) = extra.get("type").and_then(Value::as_str)
+        && !kind.is_empty()
+    {
+        if kind == "password_shadow" && extra["params"]["passwd_id"].as_u64() == Some(2) {
+            use sha1::{Digest, Sha1};
+            return Ok(hex::encode(Sha1::digest(
+                credentials.expose_password().as_bytes(),
+            )));
+        }
+        return Err(Error::Protocol(format!(
+            "Unsupported TPAP credential transformation: {kind}"
+        )));
+    }
+    Ok(if credentials.username.is_empty() {
+        credentials.expose_password().to_string()
+    } else {
+        format!("{}/{}", credentials.username, credentials.expose_password())
+    })
+}
+
 /// Compute MD5 hash and return as hex string.
 fn md5_hex(data: &str) -> String {
     use md5::{Digest, Md5};
@@ -750,4 +834,113 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, Error> {
     STANDARD
         .decode(data)
         .map_err(|e| Error::Protocol(format!("Base64 decode failed: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serve_once(response: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let body_start;
+            loop {
+                let mut buf = [0; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = find_header_end(&request) {
+                    let length =
+                        parse_content_length(&String::from_utf8_lossy(&request[..end])).unwrap();
+                    if request.len() >= end + 4 + length {
+                        body_start = end + 4;
+                        break;
+                    }
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+            request[body_start..].to_vec()
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn test_tpap_password_shadow_sha1() {
+        let credentials = Credentials::new("user@example.com", "password");
+        let result = json!({"extra_crypt":{"type":"password_shadow","params":{"passwd_id":2}}});
+        assert_eq!(
+            resolve_credentials(&credentials, &result).unwrap(),
+            "5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tpap_plain_http_request() {
+        let (port, server) = serve_once(br#"{"error_code":0}"#.to_vec());
+        let body = tokio::task::spawn_blocking(move || {
+            send_http_request_binary(
+                "127.0.0.1",
+                port,
+                "/",
+                br#"{"method":"login"}"#,
+                None,
+                Duration::from_secs(3),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(body, br#"{"error_code":0}"#);
+        assert_eq!(server.join().unwrap(), br#"{"method":"login"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_tpap_encrypted_frames_include_sequence() {
+        for response_seq in [7u32, 8] {
+            let cipher =
+                TpapSessionCipher::from_shared_key(TpapCipherType::Aes128Ccm, &[0x42; 32], false);
+            let seq = 7u32;
+            let mut response = response_seq.to_be_bytes().to_vec();
+            response.extend(
+                cipher
+                    .encrypt(br#"{"error_code":0}"#, response_seq)
+                    .unwrap(),
+            );
+            let (port, server) = serve_once(response);
+            let transport = TpapTransport {
+                host: "127.0.0.1".into(),
+                port,
+                credentials: Credentials::blank(),
+                timeout: Duration::from_secs(3),
+                tpap_info: None,
+                tls_config: Arc::new(create_tls_config().unwrap()),
+                https: false,
+                session: Some(TpapSession {
+                    session_id: "test".into(),
+                    seq: AtomicU32::new(seq),
+                    cipher: cipher.clone(),
+                }),
+            };
+            let result = transport.send(r#"{"method":"get_device_info"}"#).await;
+            let request = server.join().unwrap();
+            assert_eq!(&request[..4], &seq.to_be_bytes());
+            assert_eq!(
+                cipher.decrypt(&request[4..], seq).unwrap(),
+                br#"{"method":"get_device_info"}"#
+            );
+            assert_eq!(result.unwrap(), r#"{"error_code":0}"#);
+        }
+    }
 }
