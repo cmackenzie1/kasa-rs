@@ -7,6 +7,8 @@
 //! - [`KlapTransport`]: HTTP with AES encryption on port 80 (newer firmware)
 //! - [`SmartTransport`]: SMART protocol adapter over KLAP for SMART-family
 //!   devices (e.g., KP125M)
+//! - [`TpapTransport`]: SPAKE2+ and encrypted messages over HTTP or HTTPS;
+//!   [`connect`] also wraps these connections with the SMART adapter
 //!
 //! Use [`connect`] to automatically detect and connect using the appropriate protocol.
 
@@ -75,6 +77,8 @@ pub struct DeviceConfig {
     /// When set (e.g., from discovery), `connect()` will try this protocol first
     /// before falling back to auto-detection.
     pub encryption_hint: Option<EncryptionType>,
+    /// TPAP connection settings from discovery, including its TLS mode.
+    pub tpap_info: Option<tpap::TpapInfo>,
 }
 
 impl DeviceConfig {
@@ -87,6 +91,7 @@ impl DeviceConfig {
             timeout: DEFAULT_TIMEOUT,
             https: false,
             encryption_hint: None,
+            tpap_info: None,
         }
     }
 
@@ -140,17 +145,20 @@ impl DeviceConfig {
     /// }
     /// ```
     pub fn from_discovered(device: &DiscoveredDevice) -> Self {
-        Self::new(device.ip.to_string())
+        let mut config = Self::new(device.ip.to_string())
             .with_port(device.port)
-            .with_encryption_hint(device.encryption_type)
+            .with_encryption_hint(device.encryption_type);
+        config.tpap_info = device.tpap.clone();
+        config
     }
 }
 
 /// Attempts to connect to a device, auto-detecting the protocol.
 ///
-/// This function tries different protocols in order:
-/// 1. KLAP on port 80 (if credentials provided)
-/// 2. Legacy XOR on port 9999
+/// Discovery hints are tried first. Without a successful hint, this tries TPAP
+/// on ports 4433 and 80, then KLAP on port 80 (if credentials are provided),
+/// and legacy XOR on port 9999. SMART commands are translated automatically
+/// for SMART-family KLAP devices and TPAP devices.
 ///
 /// # Arguments
 ///
@@ -202,7 +210,7 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
             }
             EncryptionType::Tpap => {
                 if let Ok(transport) = try_tpap(&config).await {
-                    return Ok(Box::new(transport));
+                    return Ok(Box::new(SmartTransport::new(transport)));
                 }
                 tracing::debug!(
                     protocol = "TPAP",
@@ -220,15 +228,12 @@ pub async fn connect(config: DeviceConfig) -> Result<Box<dyn Transport>, Error> 
     }
 
     // Auto-detect protocol: try authenticated protocols first if credentials provided
-    let has_real_credentials = config
-        .credentials
-        .as_ref()
-        .is_some_and(|c| !c.is_blank());
+    let has_real_credentials = config.credentials.as_ref().is_some_and(|c| !c.is_blank());
 
     if config.credentials.is_some() {
         // Try TPAP first (newer firmware on port 4433)
         match try_tpap(&config).await {
-            Ok(transport) => return Ok(Box::new(transport)),
+            Ok(transport) => return Ok(Box::new(SmartTransport::new(transport))),
             Err(e) => {
                 tracing::debug!(error = %e, "TPAP connection failed, trying KLAP");
             }
@@ -296,8 +301,32 @@ fn box_klap(transport: KlapTransport) -> Box<dyn Transport> {
 async fn try_tpap(config: &DeviceConfig) -> Result<TpapTransport, Error> {
     let port = config.port.unwrap_or(tpap::DEFAULT_PORT);
     let credentials = config.credentials.clone().unwrap_or_default();
-
-    TpapTransport::connect(&config.host, port, credentials, config.timeout).await
+    let https = config
+        .tpap_info
+        .as_ref()
+        .map(|info| info.tls != 0)
+        .unwrap_or(port != 80);
+    let result = TpapTransport::connect_with_https(
+        &config.host,
+        port,
+        credentials.clone(),
+        config.timeout,
+        https,
+    )
+    .await;
+    if result.is_err() && config.port.is_none() {
+        // Direct IP polling has no discovery hint. New SMART plugs use TPAP
+        // without TLS on port 80 instead of the older HTTPS endpoint.
+        return TpapTransport::connect_with_https(
+            &config.host,
+            80,
+            credentials,
+            config.timeout,
+            false,
+        )
+        .await;
+    }
+    result
 }
 
 async fn try_klap(config: &DeviceConfig) -> Result<KlapTransport, Error> {
@@ -362,6 +391,9 @@ async fn try_legacy(config: &DeviceConfig) -> Result<LegacyTransport, Error> {
 ///     Ok(())
 /// }
 /// ```
+// async-trait adds #[must_use] to methods returning must-use futures.
+// Work around rust-lang/rust-clippy#17529.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Sends a JSON command to the device and returns the response.
@@ -427,6 +459,9 @@ pub trait Transport: Send + Sync {
 ///
 /// While methods take `&self`, requests to a single device must be sequential.
 /// See [`Transport`] documentation for details on concurrent access patterns.
+// async-trait adds #[must_use] to methods returning must-use futures.
+// Work around rust-lang/rust-clippy#17529.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TransportExt: Transport {
     /// Gets device system information.

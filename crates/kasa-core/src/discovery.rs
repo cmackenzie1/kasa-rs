@@ -26,7 +26,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::transport::EncryptionType;
+use crate::transport::{EncryptionType, tpap::TpapInfo};
 
 /// Port for legacy XOR discovery.
 pub const LEGACY_DISCOVERY_PORT: u16 = 9999;
@@ -78,6 +78,9 @@ pub struct DiscoveredDevice {
     pub new_klap: Option<bool>,
     /// Login version for KLAP.
     pub login_version: Option<u32>,
+    /// TPAP connection settings advertised by newer devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpap: Option<TpapInfo>,
 }
 
 /// Discovery result from TDP (port 20002) response.
@@ -110,6 +113,8 @@ pub struct TdpDeviceInfo {
     #[serde(default)]
     pub factory_default: bool,
     pub mgt_encrypt_schm: Option<TdpEncryptionScheme>,
+    /// Optional TPAP capabilities, including the port and TLS mode.
+    pub tpap: Option<TpapInfo>,
 }
 
 /// Encryption scheme info from TDP discovery.
@@ -389,6 +394,7 @@ fn parse_legacy_response(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
         http_port: None,
         new_klap: None,
         login_version: None,
+        tpap: None,
     })
 }
 
@@ -413,12 +419,18 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
     let encryption_type = match scheme.map(|s| s.encrypt_type.as_str()) {
         Some("KLAP") => EncryptionType::Klap,
         Some("AES") => EncryptionType::Aes,
+        Some("TPAP") => EncryptionType::Tpap,
         _ => EncryptionType::Xor,
     };
 
     let http_port = scheme.map(|s| s.http_port).filter(|&p| p > 0);
     let new_klap = scheme.map(|s| s.new_klap == 1);
     let login_version = scheme.map(|s| s.lv).filter(|&v| v > 0);
+    let tpap_port = if encryption_type == EncryptionType::Tpap {
+        info.tpap.as_ref().map(|t| t.port).filter(|&p| p > 0)
+    } else {
+        None
+    };
 
     debug!(
         ip = %ip,
@@ -431,7 +443,7 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
 
     Some(DiscoveredDevice {
         ip,
-        port: http_port.unwrap_or(80),
+        port: tpap_port.or(http_port).unwrap_or(80),
         alias: String::new(), // TDP doesn't include alias
         model: info.device_model,
         mac: info.mac,
@@ -448,12 +460,40 @@ fn parse_tdp_discovery(data: &[u8], ip: IpAddr) -> Option<DiscoveredDevice> {
         http_port,
         new_klap,
         login_version,
+        tpap: info.tpap,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_tpap_discovery_preserves_http_settings() {
+        let json = r#"{"error_code":0,"result":{"device_type":"SMART.KASAPLUG","device_model":"KP125M(US)","mgt_encrypt_schm":{"encrypt_type":"TPAP","http_port":80,"is_support_https":false,"lv":2},"tpap":{"tls":0,"dac":1,"noc":1,"pake":[2],"port":80}}}"#;
+        let mut packet = vec![0; 16];
+        packet.extend_from_slice(json.as_bytes());
+
+        let device = parse_tdp_discovery(&packet, "192.0.2.1".parse().unwrap()).unwrap();
+        assert_eq!(device.encryption_type, EncryptionType::Tpap);
+        assert_eq!(device.port, 80);
+        // Metadata must survive discovery so authentication uses HTTP, not TLS.
+        let serialized = serde_json::to_value(&device).unwrap();
+        assert_eq!(serialized["tpap"]["tls"], 0);
+        assert_eq!(serialized["tpap"]["pake"], serde_json::json!([2]));
+        let config = crate::transport::DeviceConfig::from_discovered(&device);
+        assert_eq!(config.tpap_info.unwrap().tls, 0);
+    }
+
+    #[test]
+    fn test_klap_discovery_keeps_its_port_with_tpap_capabilities() {
+        let json = r#"{"error_code":0,"result":{"mgt_encrypt_schm":{"encrypt_type":"KLAP","http_port":80},"tpap":{"tls":1,"port":4433}}}"#;
+        let mut packet = vec![0; 16];
+        packet.extend_from_slice(json.as_bytes());
+        let device = parse_tdp_discovery(&packet, "192.0.2.1".parse().unwrap()).unwrap();
+        assert_eq!(device.encryption_type, EncryptionType::Klap);
+        assert_eq!(device.port, 80);
+    }
 
     #[test]
     fn test_tdp_header_serialization() {

@@ -404,6 +404,7 @@ async fn poll_device_with_transport(
         http_port: device.http_port,
         new_klap: device.new_klap,
         login_version: device.login_version,
+        tpap: device.tpap.clone(),
     };
 
     state.metrics.set_device_info(&updated_device);
@@ -564,6 +565,7 @@ async fn poll_targeted_device(
         http_port: None,
         new_klap: None,
         login_version: None,
+        tpap: None,
     };
 
     // Now poll for additional data using the established transport
